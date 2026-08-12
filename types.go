@@ -23,8 +23,19 @@ type Issue struct {
 	ReporterID   string
 	ReporterName string
 	Resolution   string
-	Created      time.Time
-	Updated      time.Time
+	// Comments holds each comment's body as plain text, oldest first. Populated only when "comment"
+	// is among the requested fields; Jira omits it otherwise.
+	Comments []Comment
+	Created  time.Time
+	Updated  time.Time
+}
+
+// Comment is one comment on an issue, with its body flattened to plain text.
+type Comment struct {
+	ID       string
+	Body     string
+	AuthorID string
+	Created  time.Time
 }
 
 // IsAssigned reports whether the issue has a human or service assignee.
@@ -64,17 +75,28 @@ type rawIssue struct {
 }
 
 type rawFields struct {
-	Summary     string    `json:"summary"`
-	Description *ADFDoc   `json:"description"`
-	Labels      []string  `json:"labels"`
-	Created     string    `json:"created"`
-	Updated     string    `json:"updated"`
-	Status      *rawNamed `json:"status"`
-	Priority    *rawNamed `json:"priority"`
-	IssueType   *rawNamed `json:"issuetype"`
-	Resolution  *rawNamed `json:"resolution"`
-	Assignee    *rawUser  `json:"assignee"`
-	Reporter    *rawUser  `json:"reporter"`
+	Summary     string       `json:"summary"`
+	Description *ADFDoc      `json:"description"`
+	Labels      []string     `json:"labels"`
+	Created     string       `json:"created"`
+	Updated     string       `json:"updated"`
+	Status      *rawNamed    `json:"status"`
+	Priority    *rawNamed    `json:"priority"`
+	IssueType   *rawNamed    `json:"issuetype"`
+	Resolution  *rawNamed    `json:"resolution"`
+	Assignee    *rawUser     `json:"assignee"`
+	Reporter    *rawUser     `json:"reporter"`
+	Comment     *rawComments `json:"comment"`
+}
+
+// rawComments is the paginated comment container Jira nests under the "comment" field.
+type rawComments struct {
+	Comments []struct {
+		ID      string   `json:"id"`
+		Body    *ADFDoc  `json:"body"`
+		Author  *rawUser `json:"author"`
+		Created string   `json:"created"`
+	} `json:"comments"`
 }
 
 type rawNamed struct {
@@ -119,6 +141,19 @@ func (r rawIssue) toIssue() Issue {
 	}
 	if r.Fields.Reporter != nil {
 		issue.ReporterID, issue.ReporterName = r.Fields.Reporter.AccountID, r.Fields.Reporter.DisplayName
+	}
+	if r.Fields.Comment != nil {
+		issue.Comments = make([]Comment, 0, len(r.Fields.Comment.Comments))
+		for _, raw := range r.Fields.Comment.Comments {
+			comment := Comment{ID: raw.ID, Created: parseJiraTime(raw.Created)}
+			if raw.Body != nil {
+				comment.Body = raw.Body.Text()
+			}
+			if raw.Author != nil {
+				comment.AuthorID = raw.Author.AccountID
+			}
+			issue.Comments = append(issue.Comments, comment)
+		}
 	}
 	issue.Created = parseJiraTime(r.Fields.Created)
 	issue.Updated = parseJiraTime(r.Fields.Updated)
