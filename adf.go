@@ -18,6 +18,7 @@ const (
 	adfTableCell = "tableCell"
 	adfTableHead = "tableHeader"
 	adfMention   = "mention"
+	adfLink      = "link"
 
 	tableLayoutDefault = "default"
 	tableWidthDefault  = 760
@@ -31,6 +32,16 @@ const (
 // mentionPattern recognises "[@accountId]" in text passed to the builder, converting it into a real
 // Jira mention node so the user is actually notified. Plain "@name" text notifies nobody.
 var mentionPattern = regexp.MustCompile(`\[@(.*?)\]`)
+
+// issuePattern recognises "[issue:KEY]" in text passed to the builder and renders it as a link to
+// that issue. It is deliberately narrow — an uppercase project key followed by a number — so ordinary
+// bracketed prose cannot match it.
+var issuePattern = regexp.MustCompile(`\[issue:([A-Z][A-Z0-9_]*-\d+)\]`)
+
+// inlinePattern finds either token in one left-to-right pass, so a line carrying both is expanded in
+// the order the tokens appear. Group 1 is the mention account ID, group 2 the issue key; the group
+// that did not participate reports index -1.
+var inlinePattern = regexp.MustCompile(mentionPattern.String() + `|` + issuePattern.String())
 
 // ADFDoc is an Atlassian Document Format document — Jira's rich-text representation.
 type ADFDoc struct {
@@ -89,11 +100,24 @@ type Cell struct {
 // happens to have no value. The builder emits an empty paragraph instead.
 type DocBuilder struct {
 	nodes []ADFNode
+	// issueBaseURL is the site root used to turn an "[issue:KEY]" token into a link. Empty renders the
+	// key as plain text instead, so a builder made without a client still produces a valid document.
+	issueBaseURL string
 }
 
 // NewDocBuilder returns an empty builder.
 func NewDocBuilder() *DocBuilder {
 	return &DocBuilder{}
+}
+
+// NewDocBuilder returns a builder that renders "[issue:KEY]" tokens as links into this client's site.
+func (c *Client) NewDocBuilder() *DocBuilder {
+	return &DocBuilder{issueBaseURL: strings.TrimRight(c.baseURL, "/")}
+}
+
+// IssueURL is the human-facing URL for an issue key on this client's site.
+func (c *Client) IssueURL(key string) string {
+	return strings.TrimRight(c.baseURL, "/") + "/browse/" + key
 }
 
 // AddHeading appends a heading. Levels outside 1-6 are clamped to 3.
@@ -117,7 +141,7 @@ func (b *DocBuilder) AddText(text string) *DocBuilder {
 	if text == "" {
 		return b
 	}
-	b.nodes = append(b.nodes, ADFNode{Type: adfParagraph, Content: inlineNodes(text)})
+	b.nodes = append(b.nodes, ADFNode{Type: adfParagraph, Content: b.inlineNodes(text)})
 	return b
 }
 
@@ -126,7 +150,7 @@ func (b *DocBuilder) AddParagraphs(text string) *DocBuilder {
 	for _, line := range strings.Split(text, "\n") {
 		paragraph := ADFNode{Type: adfParagraph}
 		if line != "" {
-			paragraph.Content = inlineNodes(line)
+			paragraph.Content = b.inlineNodes(line)
 		}
 		b.nodes = append(b.nodes, paragraph)
 	}
@@ -217,7 +241,7 @@ func cellNode(nodeType string, cell Cell, bold bool) ADFNode {
 			text.Marks = append(text.Marks, ADFMark{Type: "strong"})
 		}
 		if cell.Href != "" {
-			text.Marks = append(text.Marks, ADFMark{Type: "link", Attrs: &ADFAttrs{Href: cell.Href}})
+			text.Marks = append(text.Marks, ADFMark{Type: adfLink, Attrs: &ADFAttrs{Href: cell.Href}})
 		}
 		paragraph.Content = []ADFNode{text}
 	}
@@ -225,17 +249,29 @@ func cellNode(nodeType string, cell Cell, bold bool) ADFNode {
 }
 
 // inlineNodes splits a line into text and mention nodes.
-func inlineNodes(line string) []ADFNode {
+func (b *DocBuilder) inlineNodes(line string) []ADFNode {
 	var nodes []ADFNode
 	last := 0
-	for _, match := range mentionPattern.FindAllStringSubmatchIndex(line, -1) {
+	for _, match := range inlinePattern.FindAllStringSubmatchIndex(line, -1) {
 		if before := line[last:match[0]]; before != "" {
 			nodes = append(nodes, ADFNode{Type: adfText, Text: before})
 		}
-		nodes = append(nodes, ADFNode{
-			Type:  adfMention,
-			Attrs: &ADFAttrs{ID: line[match[2]:match[3]]},
-		})
+		switch {
+		case match[2] >= 0: // [@accountId]
+			nodes = append(nodes, ADFNode{
+				Type:  adfMention,
+				Attrs: &ADFAttrs{ID: line[match[2]:match[3]]},
+			})
+		case match[4] >= 0: // [issue:KEY]
+			key := line[match[4]:match[5]]
+			node := ADFNode{Type: adfText, Text: key}
+			// A link mark rather than an inlineCard: a card has to resolve through Jira's smart-link
+			// service to render, a marked text node always does.
+			if b.issueBaseURL != "" {
+				node.Marks = []ADFMark{{Type: adfLink, Attrs: &ADFAttrs{Href: b.issueBaseURL + "/browse/" + key}}}
+			}
+			nodes = append(nodes, node)
+		}
 		last = match[1]
 	}
 	if remaining := line[last:]; remaining != "" {
