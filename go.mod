@@ -1,3 +1,3 @@
-module github.com/TrackStreetPlatform/da-jira-client
+module github.com/ezequielpilcsuk/jira-client
 
 go 1.25.2

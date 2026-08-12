@@ -1,4 +1,4 @@
-# da-jira-client
+# jira-client
 
 A Go client for the Jira Cloud REST v3 API, built for automations that read and mutate issues in
 bulk.
@@ -26,13 +26,13 @@ them once:
 ## Installation
 
 ```bash
-go get github.com/TrackStreetPlatform/da-jira-client
+go get github.com/ezequielpilcsuk/jira-client
 ```
 
 ## Usage
 
 ```go
-import jiraclient "github.com/TrackStreetPlatform/da-jira-client"
+import jiraclient "github.com/ezequielpilcsuk/jira-client"
 
 client := jiraclient.NewClient(
     "https://your-site.atlassian.net",
