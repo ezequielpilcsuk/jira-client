@@ -410,20 +410,52 @@ func (c *Client) TransitionByNameWithComment(ctx context.Context, key, name stri
 // — for LinkDuplicate pass the duplicate as outwardKey and the surviving issue as inwardKey, so the
 // duplicate reads "duplicates ORIGIN" and the origin reads "is duplicated by DUPLICATE".
 func (c *Client) LinkIssues(ctx context.Context, linkType, inwardKey, outwardKey string) error {
-	if linkType == "" || inwardKey == "" || outwardKey == "" {
-		return fmt.Errorf("%w: link type and both keys are required", ErrInvalidArgument)
+	return c.CreateLink(ctx, LinkInput{TypeName: linkType, InwardKey: inwardKey, OutwardKey: outwardKey})
+}
+
+// LinkInput describes an issue link. Give it either a TypeName or a TypeID — sites rename link types,
+// so an ID is the stable reference and a name is the readable one.
+type LinkInput struct {
+	TypeName string
+	TypeID   string
+	// InwardKey and OutwardKey read as "<outward> <type outward> <inward>".
+	InwardKey  string
+	OutwardKey string
+	// Comment, when set, is posted on the link in the same request.
+	Comment *ADFDoc
+}
+
+// CreateLink links two issues, optionally by type ID and optionally with a comment.
+func (c *Client) CreateLink(ctx context.Context, input LinkInput) error {
+	if input.TypeName == "" && input.TypeID == "" {
+		return fmt.Errorf("%w: a link type name or id is required", ErrInvalidArgument)
 	}
-	if inwardKey == outwardKey {
-		return fmt.Errorf("%w: cannot link %s to itself", ErrInvalidArgument, inwardKey)
+	if input.InwardKey == "" || input.OutwardKey == "" {
+		return fmt.Errorf("%w: both issue keys are required", ErrInvalidArgument)
 	}
-	if c.skipMutation("LinkIssues", linkType, inwardKey, outwardKey) == true {
+	if input.InwardKey == input.OutwardKey {
+		return fmt.Errorf("%w: cannot link %s to itself", ErrInvalidArgument, input.InwardKey)
+	}
+	if c.skipMutation("CreateLink", input.TypeName+input.TypeID, input.InwardKey, input.OutwardKey) == true {
 		return nil
 	}
 
-	_, err := c.do(ctx, "POST", apiBase+"/issueLink", map[string]any{
-		"type":         map[string]string{"name": linkType},
-		"inwardIssue":  map[string]string{"key": inwardKey},
-		"outwardIssue": map[string]string{"key": outwardKey},
-	})
+	linkType := map[string]string{}
+	if input.TypeID != "" {
+		linkType["id"] = input.TypeID
+	} else {
+		linkType["name"] = input.TypeName
+	}
+
+	payload := map[string]any{
+		"type":         linkType,
+		"inwardIssue":  map[string]string{"key": input.InwardKey},
+		"outwardIssue": map[string]string{"key": input.OutwardKey},
+	}
+	if input.Comment != nil {
+		payload["comment"] = map[string]any{"body": input.Comment}
+	}
+
+	_, err := c.do(ctx, "POST", apiBase+"/issueLink", payload)
 	return err
 }
