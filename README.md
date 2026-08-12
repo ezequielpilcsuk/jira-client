@@ -22,6 +22,9 @@ them once:
   builder emits a valid empty paragraph instead.
 - **Transitions can be resolved by name.** Transition IDs differ between sites and are not status
   IDs; `TransitionByName` looks up what is actually available on the issue.
+- **Priority rank is read, not guessed.** Priority IDs are assigned in creation order, not rank
+  order, so a scheme customised after setup can rank `Normal`(10000) above `Minor`(4). `Priorities`
+  and `PriorityRanks` return the site's real ordering.
 
 ## Installation
 
