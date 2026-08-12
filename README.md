@@ -149,3 +149,7 @@ if errors.As(err, &apiErr) {
 - Arguments that cannot possibly succeed — an over-long summary, a label containing whitespace, an
   empty document, a self-link — are rejected locally as `ErrInvalidArgument` rather than sent.
 - The client is stateless and safe for concurrent use.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Free to use, modify and redistribute, including commercially.
