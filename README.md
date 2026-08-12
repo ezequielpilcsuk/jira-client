@@ -69,6 +69,17 @@ byKey, err := client.GetIssues(ctx, []string{"ABC-1", "ABC-2"}, nil)
 `Search` follows pagination to the end, so a broad JQL returns everything — narrow the query rather
 than relying on a limit.
 
+```go
+// Resolve a person to an account id. "" and no error means nothing matched.
+accountID, err := client.AccountIDByEmail(ctx, "ada@example.com")
+
+users, err := client.SearchUsers(ctx, "Ada")
+```
+
+Jira's visibility rules apply to user search: an account whose email is private will not match on
+email even when the address is correct, so an empty result is not proof that the person has no
+account.
+
 ### Mutating
 
 ```go
