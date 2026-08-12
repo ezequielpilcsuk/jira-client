@@ -180,6 +180,19 @@ func (c *Client) CreateIssue(ctx context.Context, input CreateIssueInput) (strin
 }
 
 // UpdateSummary replaces an issue's summary.
+// DeleteIssue permanently removes an issue. Jira does not undo this, so it exists mainly for tests
+// that file real tickets and have to clean up after themselves.
+func (c *Client) DeleteIssue(ctx context.Context, key string) error {
+	if key == "" {
+		return fmt.Errorf("%w: issue key cannot be empty", ErrInvalidArgument)
+	}
+	if c.skipMutation("DeleteIssue", key) == true {
+		return nil
+	}
+	_, err := c.do(ctx, "DELETE", apiBase+"/issue/"+url.PathEscape(key), nil)
+	return err
+}
+
 func (c *Client) UpdateSummary(ctx context.Context, key, summary string) error {
 	if key == "" || strings.TrimSpace(summary) == "" {
 		return fmt.Errorf("%w: key and summary are required", ErrInvalidArgument)
