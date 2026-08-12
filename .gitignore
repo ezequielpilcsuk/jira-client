@@ -1,0 +1,19 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+
+# Local config that may carry credentials
+config.yaml
+credentials.yaml
+.env
+
+# IDE
+.idea/
+.vscode/
