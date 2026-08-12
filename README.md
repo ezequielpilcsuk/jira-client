@@ -20,6 +20,8 @@ them once:
 - **ADF has sharp edges.** A text node with empty text is invalid and rejects the entire request with
   a 400, which is trivially easy to produce from a table cell that happens to be blank. The document
   builder emits a valid empty paragraph instead.
+- **A transition can carry its comment.** `TransitionWithComment` sends both in one request, so a
+  rejected transition cannot leave an orphaned comment explaining a move that never happened.
 - **Transitions can be resolved by name.** Transition IDs differ between sites and are not status
   IDs; `TransitionByName` looks up what is actually available on the issue.
 - **Comments expand inline tokens.** `[@accountId]` becomes a mention and `[issue:KEY]` a link to

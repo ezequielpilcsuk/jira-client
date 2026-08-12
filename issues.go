@@ -305,6 +305,14 @@ func (c *Client) AddTextComment(ctx context.Context, key, text string) error {
 // destination status ID — they differ, and using the wrong one silently 400s).
 // Use Transitions to discover the available IDs for an issue.
 func (c *Client) Transition(ctx context.Context, key, transitionID string) error {
+	return c.TransitionWithComment(ctx, key, transitionID, nil)
+}
+
+// TransitionWithComment moves an issue through a transition and posts a comment as part of the same
+// request. Jira applies both atomically, so the comment cannot be orphaned by a transition that is
+// rejected — which is the reason to prefer it over a transition followed by a separate AddComment
+// when the comment explains the move. Pass a nil doc for no comment.
+func (c *Client) TransitionWithComment(ctx context.Context, key, transitionID string, comment *ADFDoc) error {
 	if key == "" || transitionID == "" {
 		return fmt.Errorf("%w: key and transition id are required", ErrInvalidArgument)
 	}
@@ -312,8 +320,14 @@ func (c *Client) Transition(ctx context.Context, key, transitionID string) error
 		return nil
 	}
 
-	_, err := c.do(ctx, "POST", apiBase+"/issue/"+url.PathEscape(key)+"/transitions",
-		map[string]any{"transition": map[string]string{"id": transitionID}})
+	payload := map[string]any{"transition": map[string]string{"id": transitionID}}
+	if comment != nil {
+		payload["update"] = map[string]any{
+			"comment": []map[string]any{{"add": map[string]any{"body": comment}}},
+		}
+	}
+
+	_, err := c.do(ctx, "POST", apiBase+"/issue/"+url.PathEscape(key)+"/transitions", payload)
 	return err
 }
 
@@ -373,6 +387,20 @@ func (c *Client) TransitionByName(ctx context.Context, key, name string) error {
 	for _, option := range options {
 		if strings.EqualFold(option.Name, name) == true {
 			return c.Transition(ctx, key, option.ID)
+		}
+	}
+	return fmt.Errorf("%w: transition %q not available on %s", ErrInvalidArgument, name, key)
+}
+
+// TransitionByNameWithComment resolves a transition by name and posts a comment with it.
+func (c *Client) TransitionByNameWithComment(ctx context.Context, key, name string, comment *ADFDoc) error {
+	options, err := c.Transitions(ctx, key)
+	if err != nil {
+		return err
+	}
+	for _, option := range options {
+		if strings.EqualFold(option.Name, name) == true {
+			return c.TransitionWithComment(ctx, key, option.ID, comment)
 		}
 	}
 	return fmt.Errorf("%w: transition %q not available on %s", ErrInvalidArgument, name, key)
