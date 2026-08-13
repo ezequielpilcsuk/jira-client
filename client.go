@@ -195,6 +195,8 @@ func (c *Client) attempt(ctx context.Context, method, path string, payload []byt
 		apiErr := newAPIError(resp.StatusCode, method+" "+path, responseBody)
 		apiErr.RetryAfter = parseRetryAfter(resp.Header)
 		apiErr.RateLimitReason = resp.Header.Get("RateLimit-Reason")
+		apiErr.RateLimitReset = parseRateLimitReset(resp.Header)
+		apiErr.NearLimit = resp.Header.Get("X-RateLimit-NearLimit") == "true"
 		return nil, apiErr
 	}
 	return responseBody, nil

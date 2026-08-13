@@ -44,7 +44,22 @@ type APIError struct {
 	// RateLimitReason is the RateLimit-Reason header, naming which limit was exceeded — global,
 	// tenant, burst, or per-issue-on-write.
 	RateLimitReason string
+	// RateLimitReset is the X-RateLimit-Reset header: when the quota refills. Retrying is the usual
+	// response, but a caller with a large batch can schedule against this instead of spinning.
+	RateLimitReset time.Time
+	// NearLimit reflects X-RateLimit-NearLimit, which Jira sets while a caller is still *under* the
+	// limit but has less than 20% of its quota left. It is the only advance warning available, and
+	// it arrives on successful responses as well as throttled ones.
+	NearLimit bool
 }
+
+// The RateLimit-Reason values Jira sends, naming which ceiling was hit.
+const (
+	RateLimitGlobal        = "jira-quota-global-based"
+	RateLimitTenant        = "jira-quota-tenant-based"
+	RateLimitBurst         = "jira-burst-based"
+	RateLimitPerIssueWrite = "jira-per-issue-on-write"
+)
 
 // Error implements error.
 func (e *APIError) Error() string {
