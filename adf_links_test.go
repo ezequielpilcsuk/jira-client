@@ -117,12 +117,12 @@ func TestAddComment_PostsExpandedTokens(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if err := client.AddComment(context.Background(), "ABC-11", doc); err != nil {
+	if _, err := client.AddComment(context.Background(), "ABC-11", doc); err != nil {
 		t.Fatalf("add comment: %v", err)
 	}
 
 	for _, fragment := range []string{`"type":"mention"`, `"id":"acct-1"`, `"type":"link"`, `/browse/ABC-10`} {
-		if !contains(posted, fragment) {
+		if contains(posted, fragment) == false {
 			t.Errorf("payload missing %s\ngot: %s", fragment, posted)
 		}
 	}

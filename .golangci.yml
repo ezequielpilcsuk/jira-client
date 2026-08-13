@@ -1,0 +1,29 @@
+# Local linting. There is no CI here by design — this library ships as a dependency, not a service —
+# so run `golangci-lint run` before tagging a release.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errcheck        # an ignored error from a Jira call is a silently-skipped mutation
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - bodyclose       # a leaked response body exhausts the connection pool under load
+    - contextcheck    # every call must carry the caller's context through to the request
+    - errorlint       # sentinel comparisons must use errors.Is, not ==
+    - misspell
+    - nilerr
+    - unconvert
+    - usestdlibvars
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    misspell:
+      locale: UK
+
+formatters:
+  enable:
+    - gofmt

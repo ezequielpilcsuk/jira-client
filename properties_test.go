@@ -54,7 +54,7 @@ func TestIssueProperty_UnmarshalsTheValueIntoDest(t *testing.T) {
 		RunID    string `json:"runID"`
 		Attempts int    `json:"attempts"`
 	}
-	if err := client.IssueProperty(context.Background(), "ABC-1", "triage", &marker); err != nil {
+	if err := client.GetIssueProperty(context.Background(), "ABC-1", "triage", &marker); err != nil {
 		t.Fatalf("read property: %v", err)
 	}
 	if marker.RunID != "run-7" || marker.Attempts != 2 {
@@ -70,7 +70,7 @@ func TestIssueProperty_UnsetPropertyIsErrNotFound(t *testing.T) {
 	})
 
 	var marker map[string]any
-	err := client.IssueProperty(context.Background(), "ABC-1", "triage", &marker)
+	err := client.GetIssueProperty(context.Background(), "ABC-1", "triage", &marker)
 	if errors.Is(err, ErrNotFound) == false {
 		t.Errorf("want ErrNotFound, got %v", err)
 	}
@@ -83,7 +83,7 @@ func TestIssueProperty_MissingValueLeavesDestAtItsZeroValue(t *testing.T) {
 	})
 
 	value := "untouched"
-	if err := client.IssueProperty(context.Background(), "ABC-1", "triage", &value); err != nil {
+	if err := client.GetIssueProperty(context.Background(), "ABC-1", "triage", &value); err != nil {
 		t.Fatalf("read property: %v", err)
 	}
 	if value != "untouched" {
@@ -155,7 +155,7 @@ func TestIssueProperty_EscapesBothPathSegments(t *testing.T) {
 	})
 
 	var value int
-	if err := client.IssueProperty(context.Background(), "ABC 1", "a/b c", &value); err != nil {
+	if err := client.GetIssueProperty(context.Background(), "ABC 1", "a/b c", &value); err != nil {
 		t.Fatalf("read property: %v", err)
 	}
 	if strings.Contains(escapedPath, "%2Fb") == false || strings.Contains(escapedPath, "ABC%201") == false {
@@ -173,15 +173,15 @@ func TestIssueProperties_RejectImpossibleArgumentsBeforeSending(t *testing.T) {
 	cases := map[string]error{
 		"empty issue key":     client.SetIssueProperty(ctx, "", "triage", 1),
 		"empty property key":  client.SetIssueProperty(ctx, "ABC-1", "", 1),
-		"empty key on read":   client.IssueProperty(ctx, "", "triage", &dest),
+		"empty key on read":   client.GetIssueProperty(ctx, "", "triage", &dest),
 		"empty key on delete": client.DeleteIssueProperty(ctx, "ABC-1", ""),
 		"long property key": client.SetIssueProperty(ctx, "ABC-1",
 			strings.Repeat("k", PropertyKeyMaxChars+1), 1),
 		"oversized value": client.SetIssueProperty(ctx, "ABC-1", "triage",
 			strings.Repeat("v", PropertyValueMaxChars)),
 		"unserialisable value": client.SetIssueProperty(ctx, "ABC-1", "triage", make(chan int)),
-		"nil dest":             client.IssueProperty(ctx, "ABC-1", "triage", nil),
-		"non-pointer dest":     client.IssueProperty(ctx, "ABC-1", "triage", dest),
+		"nil dest":             client.GetIssueProperty(ctx, "ABC-1", "triage", nil),
+		"non-pointer dest":     client.GetIssueProperty(ctx, "ABC-1", "triage", dest),
 	}
 	for name, err := range cases {
 		if errors.Is(err, ErrInvalidArgument) == false {

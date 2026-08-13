@@ -41,7 +41,7 @@ func TestComments_PagesUntilTotal(t *testing.T) {
 		_, _ = io.WriteString(w, commentPage(2, 3, "12"))
 	})
 
-	comments, err := client.Comments(context.Background(), "ABC-1")
+	comments, err := client.Comments(context.Background(), "ABC-1", "")
 
 	if err != nil {
 		t.Fatalf("comments: %v", err)
@@ -72,7 +72,7 @@ func TestComments_StopsOnAnEmptyPage(t *testing.T) {
 		_, _ = io.WriteString(w, commentPage(1, 99))
 	})
 
-	comments, err := client.Comments(context.Background(), "ABC-1")
+	comments, err := client.Comments(context.Background(), "ABC-1", "")
 	if err != nil {
 		t.Fatalf("comments: %v", err)
 	}
@@ -86,7 +86,7 @@ func TestComments_FlattensBodyAndAuthor(t *testing.T) {
 		_, _ = io.WriteString(w, commentPage(0, 1, "10"))
 	})
 
-	comments, err := client.Comments(context.Background(), "ABC-1")
+	comments, err := client.Comments(context.Background(), "ABC-1", "")
 	if err != nil {
 		t.Fatalf("comments: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestComments_DecodesCommentMissingAuthorAndBody(t *testing.T) {
 		_, _ = io.WriteString(w, `{"total":1,"comments":[{"id":"10"}]}`)
 	})
 
-	comments, err := client.Comments(context.Background(), "ABC-1")
+	comments, err := client.Comments(context.Background(), "ABC-1", "")
 	if err != nil {
 		t.Fatalf("comments: %v", err)
 	}
@@ -153,8 +153,8 @@ func TestComments_RejectsAnUnsortableOrder(t *testing.T) {
 }
 
 // AddComment throws the 201 body away, so the created comment's id is unrecoverable. This is the
-// whole reason AddCommentReturning exists.
-func TestAddCommentReturning_ReturnsTheCreatedComment(t *testing.T) {
+// whole reason AddComment returns the comment rather than just an error.
+func TestAddComment_ReturnsTheCreatedComment(t *testing.T) {
 	var payload map[string]any
 	var method, path string
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +169,7 @@ func TestAddCommentReturning_ReturnsTheCreatedComment(t *testing.T) {
 	})
 
 	doc, _ := TextDoc("posted")
-	comment, err := client.AddCommentReturning(context.Background(), "ABC-1", doc)
+	comment, err := client.AddComment(context.Background(), "ABC-1", doc)
 
 	if err != nil {
 		t.Fatalf("add: %v", err)
@@ -190,7 +190,7 @@ func TestAddCommentReturning_ReturnsTheCreatedComment(t *testing.T) {
 
 // The write is suppressed, so there is no 201 body to decode. It has to degrade like CreateIssue
 // rather than fail on an empty response.
-func TestAddCommentReturning_DryRunReturnsAPlaceholder(t *testing.T) {
+func TestAddComment_DryRunReturnsAPlaceholder(t *testing.T) {
 	var writes []string
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		writes = append(writes, r.Method+" "+r.URL.Path)
@@ -199,7 +199,7 @@ func TestAddCommentReturning_DryRunReturnsAPlaceholder(t *testing.T) {
 	ctx := context.Background()
 	doc, _ := TextDoc("posted")
 
-	comment, err := client.AddCommentReturning(ctx, "ABC-1", doc)
+	comment, err := client.AddComment(ctx, "ABC-1", doc)
 	if err != nil {
 		t.Fatalf("dry run must not fail: %v", err)
 	}
@@ -319,10 +319,10 @@ func TestCommentLifecycle_RejectsBeforeSending(t *testing.T) {
 	doc, _ := TextDoc("text")
 
 	cases := map[string]error{
-		"list without key":   mustErr(func() error { _, err := client.Comments(ctx, ""); return err }),
-		"add without key":    mustErr(func() error { _, err := client.AddCommentReturning(ctx, "", doc); return err }),
-		"add without doc":    mustErr(func() error { _, err := client.AddCommentReturning(ctx, "ABC-1", nil); return err }),
-		"add an empty doc":   mustErr(func() error { _, err := client.AddCommentReturning(ctx, "ABC-1", &ADFDoc{}); return err }),
+		"list without key":   mustErr(func() error { _, err := client.Comments(ctx, "", ""); return err }),
+		"add without key":    mustErr(func() error { _, err := client.AddComment(ctx, "", doc); return err }),
+		"add without doc":    mustErr(func() error { _, err := client.AddComment(ctx, "ABC-1", nil); return err }),
+		"add an empty doc":   mustErr(func() error { _, err := client.AddComment(ctx, "ABC-1", &ADFDoc{}); return err }),
 		"update without id":  client.UpdateComment(ctx, "ABC-1", "", doc),
 		"update without doc": client.UpdateComment(ctx, "ABC-1", "10042", nil),
 		"delete without id":  client.DeleteComment(ctx, "ABC-1", ""),
@@ -351,19 +351,40 @@ func TestCommentLifecycle_RejectsBeforeSending(t *testing.T) {
 }
 
 // The 5,000-comment ceiling is permanent, not a rate limit — a caller has to stop, not back off.
-func TestAddCommentReturning_EntityCeilingIsALimitNotARateLimit(t *testing.T) {
+func TestAddComment_EntityCeilingIsALimitNotARateLimit(t *testing.T) {
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusRequestEntityTooLarge)
 		_, _ = io.WriteString(w, `{"errorMessages":["Issue has too many comments"]}`)
 	})
 
 	doc, _ := TextDoc("one too many")
-	_, err := client.AddCommentReturning(context.Background(), "ABC-1", doc)
+	_, err := client.AddComment(context.Background(), "ABC-1", doc)
 
 	if errors.Is(err, ErrLimitExceeded) == false {
 		t.Errorf("want ErrLimitExceeded, got %v", err)
 	}
 	if errors.Is(err, ErrRateLimited) == true {
 		t.Error("an entity limit must not be confused with a rate limit")
+	}
+}
+
+// A 2xx whose body will not decode still means the comment was posted. Returning an error there
+// would tell the caller the write failed, and a caller that retries posts it twice.
+func TestAddComment_UndecodableBodyIsNotAFailedWrite(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	})
+
+	doc, err := TextDoc("posted")
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+
+	comment, err := client.AddComment(context.Background(), "ABC-1", doc)
+	if err != nil {
+		t.Fatalf("an unreadable response body must not read as a failed write: %v", err)
+	}
+	if comment.ID != "" {
+		t.Errorf("no id was recoverable, got %q", comment.ID)
 	}
 }

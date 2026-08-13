@@ -27,7 +27,7 @@ func TestPriorities_UsesTheNonDeprecatedEndpoint(t *testing.T) {
 		_, _ = io.WriteString(w, liveSchemeResponse)
 	})
 
-	if _, err := client.Priorities(context.Background()); err != nil {
+	if _, err := client.Priorities(context.Background(), PriorityQuery{}); err != nil {
 		t.Fatalf("priorities: %v", err)
 	}
 	if requestedPath != "/rest/api/3/priority/search" {
@@ -62,7 +62,7 @@ func TestPriorities_FollowsPagination(t *testing.T) {
 		_, _ = io.WriteString(w, `{"isLast":true,"values":[{"id":"2","name":"Critical"}]}`)
 	})
 
-	priorities, err := client.Priorities(context.Background())
+	priorities, err := client.Priorities(context.Background(), PriorityQuery{})
 	if err != nil {
 		t.Fatalf("priorities: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestPriorities_RanksInResponseOrderNotByID(t *testing.T) {
 		_, _ = io.WriteString(w, liveSchemeResponse)
 	})
 
-	priorities, err := client.Priorities(context.Background())
+	priorities, err := client.Priorities(context.Background(), PriorityQuery{})
 	if err != nil {
 		t.Fatalf("priorities: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestPriorityRanks_NormalOutranksMinorDespiteHigherID(t *testing.T) {
 		_, _ = io.WriteString(w, liveSchemeResponse)
 	})
 
-	ranks, err := client.PriorityRanks(context.Background())
+	ranks, err := client.PriorityRanks(context.Background(), PriorityQuery{})
 	if err != nil {
 		t.Fatalf("priority ranks: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestPriorities_EmptySchemeIsAnError(t *testing.T) {
 		_, _ = io.WriteString(w, `{"isLast":true,"values":[]}`)
 	})
 
-	if _, err := client.Priorities(context.Background()); err == nil {
+	if _, err := client.Priorities(context.Background(), PriorityQuery{}); err == nil {
 		t.Fatal("an empty scheme must be an error, not an empty ranking")
 	}
 }
@@ -140,7 +140,7 @@ func TestPriorityRanks_WorksOnADryClient(t *testing.T) {
 		_, _ = io.WriteString(w, liveSchemeResponse)
 	}, WithDryRun(true))
 
-	ranks, err := client.PriorityRanks(context.Background())
+	ranks, err := client.PriorityRanks(context.Background(), PriorityQuery{})
 	if err != nil {
 		t.Fatalf("priority ranks on dry client: %v", err)
 	}

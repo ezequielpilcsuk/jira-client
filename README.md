@@ -55,7 +55,7 @@ client := jiraclient.NewClient(
     jiraclient.WithDryRun(cfg.DryRun),
 )
 
-issues, err := client.Search(ctx, `project = ABC AND statusCategory != Done`, nil)
+issues, err := client.SearchIssues(ctx, `project = ABC AND statusCategory != Done`, nil)
 ```
 
 ### Reading
@@ -119,7 +119,7 @@ if builder.Len() > jiraclient.CommentMaxChars {
 }
 
 doc, err := builder.Build()
-err = client.AddComment(ctx, "ABC-123", doc)
+comment, err := client.AddComment(ctx, "ABC-123", doc)   // the ID is the only handle on it
 ```
 
 `[@accountId]` becomes a real mention node, which actually notifies the user — plain `@name` text
@@ -131,9 +131,9 @@ does not.
 client := jiraclient.NewClient(baseURL, email, token, jiraclient.WithDryRun(true))
 
 // Reads still hit Jira.
-issues, _ := client.Search(ctx, jql, nil)
+issues, _ := client.SearchIssues(ctx, jql, nil)
 
-// Every mutation is logged and skipped; CreateIssue returns "DRY-RUN".
+// Every mutation is logged and skipped; creating calls return jiraclient.DryRunID.
 _ = client.TransitionByName(ctx, "ABC-124", "Won't Do")
 ```
 
@@ -152,11 +152,11 @@ resolved by name:
 // customfield_10004 is not the same number on the next site.
 fieldID, err := client.FieldIDByName(ctx, "Story Points")   // ambiguous name -> ErrInvalidArgument
 linkTypeID, err := client.LinkTypeIDByName(ctx, "Blocks")
-ranks, err := client.PriorityRanks(ctx)
+ranks, err := client.PriorityRanks(ctx, jiraclient.PriorityQuery{})
 accountID, err := client.AccountIDByEmail(ctx, "ada@example.com")
 
 me, err := client.Myself(ctx)                                // also a credential check
-projects, err := client.Projects(ctx)
+projects, err := client.Projects(ctx, jiraclient.ProjectQuery{})
 types, err := client.ProjectStatuses(ctx, "ABC")             // issue types + their statuses
 ```
 
@@ -190,7 +190,7 @@ edits:
 err := client.SetIssueProperty(ctx, "ABC-123", "my-bot:processed", map[string]any{"run": 42})
 
 var state struct{ Run int }
-err = client.IssueProperty(ctx, "ABC-123", "my-bot:processed", &state)
+err = client.GetIssueProperty(ctx, "ABC-123", "my-bot:processed", &state)
 ```
 
 `SetRemoteLink` is idempotent the same way: posting with a `globalId` that already exists updates
@@ -227,6 +227,22 @@ if errors.As(err, &apiErr) {
   empty document, a self-link, more than 50 reconcile ids — are rejected locally as
   `ErrInvalidArgument` rather than sent.
 - The client is stateless and safe for concurrent use.
+
+### Attachments and worklogs
+
+```go
+uploaded, err := client.AddAttachment(ctx, "ABC-123", "crash.log", file)
+content, err := client.DownloadAttachment(ctx, uploaded[0].ID)
+
+_, err = client.AddWorklog(ctx, "ABC-123", jiraclient.WorklogInput{
+    TimeSpentSeconds: 3600,
+    Adjust:           jiraclient.EstimateAuto,
+})
+```
+
+Worklog estimate adjustment is asymmetric per verb and enforced locally: `manual` is unusable on
+update, and a companion amount supplied without its adjustment is silently dropped by Jira — which
+then applies `auto` and quietly corrupts the remaining estimate.
 
 ### Consistency: reads are not all equal
 

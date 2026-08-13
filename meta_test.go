@@ -271,7 +271,7 @@ func TestProjects_UsesTheNonDeprecatedEndpoint(t *testing.T) {
 		_, _ = io.WriteString(w, `{"isLast":true,"values":[]}`)
 	})
 
-	if _, err := client.Projects(context.Background()); err != nil {
+	if _, err := client.Projects(context.Background(), ProjectQuery{}); err != nil {
 		t.Fatalf("projects: %v", err)
 	}
 	if requestedPath != "/rest/api/3/project/search" {
@@ -287,7 +287,7 @@ func TestProjects_RequestsAtMostTheClampedPageSize(t *testing.T) {
 		_, _ = io.WriteString(w, `{"isLast":true,"values":[]}`)
 	})
 
-	if _, err := client.Projects(context.Background()); err != nil {
+	if _, err := client.Projects(context.Background(), ProjectQuery{}); err != nil {
 		t.Fatalf("projects: %v", err)
 	}
 	if requestedMax != "100" {
@@ -316,7 +316,7 @@ func TestProjects_PagesOnIsLastNotOnTotalOrRowCount(t *testing.T) {
 		}
 	})
 
-	projects, err := client.Projects(context.Background())
+	projects, err := client.Projects(context.Background(), ProjectQuery{})
 	if err != nil {
 		t.Fatalf("projects: %v", err)
 	}

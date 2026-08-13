@@ -32,7 +32,7 @@ func TestSearch_PagesUntilLast(t *testing.T) {
 		_, _ = io.WriteString(w, `{"issues":[{"key":"ABC-2","fields":{"summary":"two"}}],"isLast":true}`)
 	})
 
-	issues, err := client.Search(context.Background(), "project = ABC", nil)
+	issues, err := client.SearchIssues(context.Background(), "project = ABC", nil)
 
 	if err != nil {
 		t.Fatalf("search: %v", err)
@@ -54,7 +54,7 @@ func TestSearch_DecodesIssueMissingEveryOptionalField(t *testing.T) {
 		_, _ = io.WriteString(w, `{"issues":[{"key":"ABC-1","fields":{"summary":"bare"}}],"isLast":true}`)
 	})
 
-	issues, err := client.Search(context.Background(), "project = ABC", nil)
+	issues, err := client.SearchIssues(context.Background(), "project = ABC", nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestSearch_MapsPopulatedFields(t *testing.T) {
 		}}],"isLast":true}`)
 	})
 
-	issues, _ := client.Search(context.Background(), "project = ABC", nil)
+	issues, _ := client.SearchIssues(context.Background(), "project = ABC", nil)
 	issue := issues[0]
 
 	if issue.Status != "In Progress" || issue.StatusID != "3" {
@@ -115,7 +115,7 @@ func TestDryRun_SuppressesEveryMutationButNotReads(t *testing.T) {
 	}, WithDryRun(true))
 
 	ctx := context.Background()
-	if _, err := client.Search(ctx, "project = ABC", nil); err != nil {
+	if _, err := client.SearchIssues(ctx, "project = ABC", nil); err != nil {
 		t.Fatalf("read must still work: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestDryRun_SuppressesEveryMutationButNotReads(t *testing.T) {
 		"AddLabel":      client.AddLabel(ctx, "ABC-1", "x"),
 		"RemoveLabel":   client.RemoveLabel(ctx, "ABC-1", "x"),
 		"UpdateSummary": client.UpdateSummary(ctx, "ABC-1", "new"),
-		"AddComment":    client.AddTextComment(ctx, "ABC-1", "hi"),
+		"AddComment":    errOf(func() (Comment, error) { return client.AddTextComment(ctx, "ABC-1", "hi") }),
 		"Transition":    client.Transition(ctx, "ABC-1", "71"),
 		"LinkIssues":    client.LinkIssues(ctx, LinkDuplicate, "ABC-1", "ABC-2"),
 		"CustomField":   client.UpdateCustomField(ctx, "ABC-1", "customfield_1", 3),
@@ -213,13 +213,13 @@ func TestLocalValidation_RejectsBeforeSending(t *testing.T) {
 	ctx := context.Background()
 
 	cases := map[string]error{
-		"empty jql":       mustErr(func() error { _, err := client.Search(ctx, "  ", nil); return err }),
+		"empty jql":       mustErr(func() error { _, err := client.SearchIssues(ctx, "  ", nil); return err }),
 		"long summary":    client.UpdateSummary(ctx, "ABC-1", strings.Repeat("x", SummaryMaxChars+1)),
 		"empty summary":   client.UpdateSummary(ctx, "ABC-1", "  "),
 		"label w/ space":  client.AddLabel(ctx, "ABC-1", "two words"),
 		"self link":       client.LinkIssues(ctx, LinkDuplicate, "ABC-1", "ABC-1"),
 		"empty link type": client.LinkIssues(ctx, "", "ABC-1", "ABC-2"),
-		"empty comment":   client.AddTextComment(ctx, "ABC-1", "   "),
+		"empty comment":   errOf(func() (Comment, error) { return client.AddTextComment(ctx, "ABC-1", "   ") }),
 	}
 	for name, err := range cases {
 		if errors.Is(err, ErrInvalidArgument) == false {
@@ -358,3 +358,9 @@ func TestGetIssues_ChunksKeys(t *testing.T) {
 }
 
 func mustErr(fn func() error) error { return fn() }
+
+// errOf discards a mutator's returned value, keeping the error tables below one column wide.
+func errOf(call func() (Comment, error)) error {
+	_, err := call()
+	return err
+}
