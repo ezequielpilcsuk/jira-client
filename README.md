@@ -29,6 +29,12 @@ them once:
 - **Priority rank is read, not guessed.** Priority IDs are assigned in creation order, not rank
   order, so a scheme customised after setup can rank `Normal`(10000) above `Minor`(4). `Priorities`
   and `PriorityRanks` return the site's real ordering.
+- **Search-after-write is not silently wrong.** Jira's search index is eventually consistent, so an
+  issue created a moment ago can be missing from a JQL result. `GetIssues` reads issues directly and
+  `SearchReconciled` reconciles the ids you name, rather than leaving it to chance.
+- **Site-specific IDs are discoverable.** Custom field IDs, link type IDs, priorities and account ids
+  differ per site, and hardcoding them is what makes an integration break on the next Jira. Every one
+  can be resolved by name.
 
 ## Installation
 
@@ -137,14 +143,68 @@ Attach a logger to see what would have happened:
 jiraclient.WithLogger(log.New(os.Stderr, "", log.LstdFlags))
 ```
 
+### Discovery
+
+Site-specific IDs are the most brittle thing to hardcode in a Jira integration, so they can all be
+resolved by name:
+
+```go
+// customfield_10004 is not the same number on the next site.
+fieldID, err := client.FieldIDByName(ctx, "Story Points")   // ambiguous name -> ErrInvalidArgument
+linkTypeID, err := client.LinkTypeIDByName(ctx, "Blocks")
+ranks, err := client.PriorityRanks(ctx)
+accountID, err := client.AccountIDByEmail(ctx, "ada@example.com")
+
+me, err := client.Myself(ctx)                                // also a credential check
+projects, err := client.Projects(ctx)
+types, err := client.ProjectStatuses(ctx, "ABC")             // issue types + their statuses
+```
+
+Prefer `Issue.StatusCategory` (`new` / `indeterminate` / `done`) over `Issue.Status` for "is this
+finished" — status *names* are per-workflow and site-editable, so a check against `"Done"` breaks on
+any project that renamed it. `Issue.IsDone()` wraps it.
+
+### Planning a query without running it
+
+`/search/jql` dropped the `validateQuery` parameter, so validating JQL and counting matches are now
+separate calls. Both suit a dry run, which is meant to produce a reviewable plan without writing:
+
+```go
+results, err := client.ValidateJQL(ctx, jql)     // errors and warnings, without executing
+count, err := client.ApproximateCount(ctx, jql)  // estimated; /search/jql no longer returns a total
+allowed, err := client.MyPermissions(ctx,
+    jiraclient.PermissionScope{IssueKey: "ABC-123"}, "EDIT_ISSUES")
+```
+
+⚠️ Scope permission checks to an **issue** where you can. Atlassian documents project-scoped answers
+as optimistic: a user can be reported as holding a permission in a project context without holding it
+for any particular issue.
+
+### Idempotency
+
+An automation that must not process a ticket twice usually ends up encoding state in labels or
+comment text. Issue properties are the intended mechanism — invisible to users, and they survive
+edits:
+
+```go
+err := client.SetIssueProperty(ctx, "ABC-123", "my-bot:processed", map[string]any{"run": 42})
+
+var state struct{ Run int }
+err = client.IssueProperty(ctx, "ABC-123", "my-bot:processed", &state)
+```
+
+`SetRemoteLink` is idempotent the same way: posting with a `globalId` that already exists updates
+that link rather than adding a second one — though it is a *replace*, so fields you omit are nulled.
+
 ### Errors
 
 ```go
 switch {
 case errors.Is(err, jiraclient.ErrNotFound):
 case errors.Is(err, jiraclient.ErrUnauthorized):
-case errors.Is(err, jiraclient.ErrRateLimited):
-case errors.Is(err, jiraclient.ErrInvalidArgument):  // rejected before any request was sent
+case errors.Is(err, jiraclient.ErrRateLimited):     // 429, transient — back off
+case errors.Is(err, jiraclient.ErrLimitExceeded):   // 413, permanent — retrying will not help
+case errors.Is(err, jiraclient.ErrInvalidArgument): // rejected before any request was sent
 }
 
 var apiErr *jiraclient.APIError
@@ -157,11 +217,44 @@ if errors.As(err, &apiErr) {
 
 ## Notes
 
-- Authentication is Jira Cloud basic auth: account email plus an API token.
-- REST **v3** throughout; v2 is deprecated and is not ADF-native.
+- Authentication is Jira Cloud basic auth: account email plus an API token. Note that API tokens now
+  **expire** — a year by default — so a 401 on a call that used to work usually means the token needs
+  reissuing rather than that permissions changed.
+- REST **v3** throughout, because it is ADF-native. v2 is *not* deprecated — Atlassian maintains both
+  and documents them as offering the same operations. `/rest/api/latest` resolves to v2 semantics, so
+  it is not a safe alias for v3.
 - Arguments that cannot possibly succeed — an over-long summary, a label containing whitespace, an
-  empty document, a self-link — are rejected locally as `ErrInvalidArgument` rather than sent.
+  empty document, a self-link, more than 50 reconcile ids — are rejected locally as
+  `ErrInvalidArgument` rather than sent.
 - The client is stateless and safe for concurrent use.
+
+### Consistency: reads are not all equal
+
+Jira serves searches from an index that is only **eventually consistent**. After a write, a search
+can return stale data or miss the issue outright, for anything from seconds to minutes. Three
+different guarantees are available, and picking the wrong one is the classic source of
+"my automation didn't see the ticket it just created":
+
+| Call | Consistency |
+|---|---|
+| `GetIssue`, `GetIssues` | **Strong** — reads issues directly |
+| `SearchReconciled(..., issueIDs)` | Strong **for the ids named** (max 50), eventual for the rest |
+| `Search` | Eventual |
+
+`Search` also returns a `SearchResult.Warnings` via `SearchReconciled` — worth checking, because a
+JQL that Jira warned about still returns HTTP 200 with an empty result set, making a broken query
+indistinguishable from one that legitimately matched nothing.
+
+### Rate limits
+
+`DefaultRetryPolicy` follows Atlassian's published guidance: exponential backoff with jitter, never
+shorter than the server's `Retry-After`. On a 429, `APIError` carries `RateLimitReason` (which ceiling
+was hit — global, tenant, burst, or per-issue-on-write), `RateLimitReset` (when the quota refills, so
+a large batch can schedule rather than spin) and `NearLimit`, Jira's advance warning that under 20% of
+quota remains.
+
+`ErrLimitExceeded` (HTTP 413) is a different thing entirely: a permanent per-issue ceiling — 5,000
+comments or worklogs, 2,000 attachments or links on one issue. Retrying never clears it.
 
 ## License
 

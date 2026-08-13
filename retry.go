@@ -105,6 +105,16 @@ func sleep(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+// parseRateLimitReset reads X-RateLimit-Reset, an ISO 8601 timestamp naming when the quota refills.
+// Absent from most responses, so a zero time means "not stated" rather than "now".
+func parseRateLimitReset(header http.Header) time.Time {
+	raw := header.Get("X-RateLimit-Reset")
+	if raw == "" {
+		return time.Time{}
+	}
+	return parseJiraTime(raw)
+}
+
 // parseRetryAfter reads the Retry-After header, which Jira sends in seconds.
 func parseRetryAfter(header http.Header) time.Duration {
 	raw := header.Get("Retry-After")

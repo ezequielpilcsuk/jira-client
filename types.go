@@ -9,20 +9,24 @@ import (
 // at decode time, so callers never dereference a missing description, assignee or reporter — the
 // single most common panic in hand-rolled Jira integrations.
 type Issue struct {
-	ID           string
-	Key          string
-	Summary      string
-	Description  string // plain text, extracted from the ADF document
-	Status       string
-	StatusID     string
-	Priority     string
-	IssueType    string
-	Labels       []string
-	AssigneeID   string
-	AssigneeName string
-	ReporterID   string
-	ReporterName string
-	Resolution   string
+	ID          string
+	Key         string
+	Summary     string
+	Description string // plain text, extracted from the ADF document
+	Status      string
+	StatusID    string
+	// StatusCategory is the stable lifecycle bucket behind the status: "new", "indeterminate" or
+	// "done". Prefer it over Status for "is this finished" — status *names* are per-workflow and
+	// site-editable, so a check against "Done" breaks on any project that renamed it.
+	StatusCategory string
+	Priority       string
+	IssueType      string
+	Labels         []string
+	AssigneeID     string
+	AssigneeName   string
+	ReporterID     string
+	ReporterName   string
+	Resolution     string
 	// Comments holds each comment's body as plain text, oldest first. Populated only when "comment"
 	// is among the requested fields; Jira omits it otherwise.
 	Comments []Comment
@@ -38,8 +42,19 @@ type Comment struct {
 	Created  time.Time
 }
 
+// Status category keys. These are fixed by Jira and are the same on every site, unlike status names.
+const (
+	StatusCategoryNew        = "new"
+	StatusCategoryInProgress = "indeterminate"
+	StatusCategoryDone       = "done"
+)
+
 // IsAssigned reports whether the issue has a human or service assignee.
 func (i Issue) IsAssigned() bool { return i.AssigneeID != "" }
+
+// IsDone reports whether the issue has reached a done-category status, whatever that status is
+// called on this site. Empty when the status field was not requested.
+func (i Issue) IsDone() bool { return i.StatusCategory == StatusCategoryDone }
 
 // HasLabel reports whether the issue carries a label, compared case-insensitively because Jira
 // preserves the case a label was created with but treats labels as case-sensitive on write.
@@ -119,6 +134,11 @@ type rawComments struct {
 type rawNamed struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// StatusCategory is populated on the status field only, and arrives with every normal read.
+	StatusCategory *struct {
+		Key  string `json:"key"`
+		Name string `json:"name"`
+	} `json:"statusCategory"`
 }
 
 type rawUser struct {
@@ -154,6 +174,9 @@ func (r rawIssue) toIssue() Issue {
 	}
 	if r.Fields.Status != nil {
 		issue.Status, issue.StatusID = r.Fields.Status.Name, r.Fields.Status.ID
+		if r.Fields.Status.StatusCategory != nil {
+			issue.StatusCategory = r.Fields.Status.StatusCategory.Key
+		}
 	}
 	if r.Fields.Priority != nil {
 		issue.Priority = r.Fields.Priority.Name
