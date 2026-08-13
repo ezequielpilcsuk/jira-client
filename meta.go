@@ -276,11 +276,7 @@ type ProjectQuery struct {
 //
 // This is /project/search, not the deprecated /project — the latter returns every project in one
 // unpaginated response and Atlassian has flagged it for removal.
-func (c *Client) Projects(ctx context.Context, query ...ProjectQuery) ([]Project, error) {
-	var filter ProjectQuery
-	if len(query) > 0 {
-		filter = query[0]
-	}
+func (c *Client) Projects(ctx context.Context, filter ProjectQuery) ([]Project, error) {
 	if len(filter.Keys) > maxProjectFilterValues {
 		return nil, fmt.Errorf("%w: at most %d project keys can be filtered on, got %d",
 			ErrInvalidArgument, maxProjectFilterValues, len(filter.Keys))

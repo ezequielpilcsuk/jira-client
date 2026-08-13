@@ -104,14 +104,9 @@ func (r rawComment) toComment() Comment {
 // retrying. And jsdPublic, the flag deciding whether a Jira Service Management comment is visible to
 // the customer or internal, is read-only on this API: it can only be set through the Service Desk
 // API, so this endpoint cannot make a comment customer-facing.
-func (c *Client) Comments(ctx context.Context, key string, order ...CommentOrder) ([]Comment, error) {
+func (c *Client) Comments(ctx context.Context, key string, sort CommentOrder) ([]Comment, error) {
 	if key == "" {
 		return nil, fmt.Errorf("%w: issue key cannot be empty", ErrInvalidArgument)
-	}
-
-	var sort CommentOrder
-	if len(order) > 0 {
-		sort = order[0]
 	}
 	if sort != "" && validCommentOrders[sort] == false {
 		return nil, fmt.Errorf("%w: comment order %q is not one of created, +created, -created",
@@ -155,14 +150,15 @@ func (c *Client) Comments(ctx context.Context, key string, order ...CommentOrder
 	return comments, nil
 }
 
-// AddCommentReturning posts a comment and returns it as Jira stored it, unlike AddComment which
-// discards the response. Take this one when the comment has to be edited or deleted later — its ID
-// is the only handle on it, and there is no way to recover it afterwards short of listing every
-// comment on the issue and guessing.
+// AddComment posts a comment and returns it as Jira stored it.
 //
-// In dry-run mode nothing is posted and the returned Comment carries the ID "DRY-RUN", mirroring
+// The ID is the only handle on a comment — there is no recovering it afterwards short of listing
+// every comment on the issue and guessing which one you wrote — so it is returned rather than
+// discarded, even though most callers ignore it.
+//
+// In dry-run mode nothing is posted and the returned Comment carries DryRunID, mirroring
 // CreateIssue. A caller feeding that ID back into UpdateComment or DeleteComment is likewise a no-op.
-func (c *Client) AddCommentReturning(ctx context.Context, key string, doc *ADFDoc) (Comment, error) {
+func (c *Client) AddComment(ctx context.Context, key string, doc *ADFDoc) (Comment, error) {
 	return c.addComment(ctx, key, doc, nil)
 }
 
@@ -188,7 +184,7 @@ func (c *Client) addComment(ctx context.Context, key string, doc *ADFDoc, vis *V
 		return Comment{}, fmt.Errorf("%w: %v", ErrInvalidArgument, errEmptyDoc)
 	}
 	if c.skipMutation("AddComment", key) == true {
-		return Comment{ID: "DRY-RUN"}, nil
+		return Comment{ID: DryRunID}, nil
 	}
 
 	payload := map[string]any{"body": doc}
@@ -201,14 +197,18 @@ func (c *Client) addComment(ctx context.Context, key string, doc *ADFDoc, vis *V
 		return Comment{}, err
 	}
 
+	// The comment exists by this point — Jira answered 2xx. Reporting a decode failure as an error
+	// would tell the caller the write failed, and a caller that retries posts the comment twice.
+	// A body we cannot read costs the ID, not the comment, so it is logged and swallowed.
 	var created rawComment
 	if err := json.Unmarshal(body, &created); err != nil {
-		return Comment{}, fmt.Errorf("decode created comment on %s: %w", key, err)
+		c.logf("jira: comment posted on %s but the response could not be decoded: %v", key, err)
+		return Comment{}, nil
 	}
 	return created.toComment(), nil
 }
 
-// UpdateComment replaces a comment's body. The comment ID comes from AddCommentReturning or
+// UpdateComment replaces a comment's body. The comment ID comes from AddComment or
 // Comments; it is not the issue key.
 //
 // Jira rewrites the body in place and records the caller as its update author — there is no revision

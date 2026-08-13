@@ -50,12 +50,12 @@ func (c *Client) IssuePropertyKeys(ctx context.Context, key string) ([]string, e
 	return keys, nil
 }
 
-// IssueProperty reads one property and unmarshals its value into dest, which must be a non-nil
+// GetIssueProperty reads one property and unmarshals its value into dest, which must be a non-nil
 // pointer.
 //
 // A property that was never set is a 404, so errors.Is(err, ErrNotFound) is the "not processed yet"
 // branch an idempotency check wants — it is not an error worth surfacing.
-func (c *Client) IssueProperty(ctx context.Context, key, propertyKey string, dest any) error {
+func (c *Client) GetIssueProperty(ctx context.Context, key, propertyKey string, dest any) error {
 	if err := validatePropertyArgs(key, propertyKey); err != nil {
 		return err
 	}

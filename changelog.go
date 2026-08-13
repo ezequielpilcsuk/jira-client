@@ -89,32 +89,42 @@ func (c *Client) Changelog(ctx context.Context, key string) ([]ChangelogEntry, e
 	return entries, nil
 }
 
+// IssueChangelog is one issue's history as a bulk fetch returns it.
+type IssueChangelog struct {
+	// IssueID is the numeric issue id. The bulk endpoint reports only ids — never keys, even when you
+	// asked by key — so this cannot be mapped back to an input key without a separate read. That is
+	// why this is a slice rather than a map: a map would imply a lookup the API cannot support.
+	IssueID string
+	Entries []ChangelogEntry
+}
+
 // Changelogs fetches many issues' histories together, chunked at Jira's cap of 1000 issues per
 // request and following the endpoint's page token to the end.
 //
-// The result is keyed by numeric issue id — what the endpoint reports back — and not by the key you
-// passed in, so a caller starting from keys has to map them itself. Issue.ID carries the id.
-//
 // fieldIDs narrows the history to particular fields, e.g. "status" or "assignee". Jira accepts at
 // most 10; an empty slice returns every field. Issues with no history at all are simply absent from
-// the map.
-func (c *Client) Changelogs(ctx context.Context, keys, fieldIDs []string) (map[string][]ChangelogEntry, error) {
+// the result.
+func (c *Client) Changelogs(ctx context.Context, issueIDsOrKeys, fieldIDs []string) ([]IssueChangelog, error) {
 	if len(fieldIDs) > changelogMaxFields {
 		return nil, fmt.Errorf("%w: at most %d field ids can be requested, got %d",
 			ErrInvalidArgument, changelogMaxFields, len(fieldIDs))
 	}
 
-	histories := make(map[string][]ChangelogEntry, len(keys))
-	for start := 0; start < len(keys); start += changelogBulkChunk {
+	// Accumulated by issue id first: one issue's history can span pages, and appending straight to the
+	// slice would emit it as two separate entries.
+	byIssue := map[string][]ChangelogEntry{}
+	var order []string
+
+	for start := 0; start < len(issueIDsOrKeys); start += changelogBulkChunk {
 		end := start + changelogBulkChunk
-		if end > len(keys) {
-			end = len(keys)
+		if end > len(issueIDsOrKeys) {
+			end = len(issueIDsOrKeys)
 		}
 
 		pageToken := ""
 		for {
 			payload := map[string]any{
-				"issueIdsOrKeys": keys[start:end],
+				"issueIdsOrKeys": issueIDsOrKeys[start:end],
 				"maxResults":     changelogPageSize,
 			}
 			if len(fieldIDs) > 0 {
@@ -140,8 +150,14 @@ func (c *Client) Changelogs(ctx context.Context, keys, fieldIDs []string) (map[s
 				return nil, fmt.Errorf("decode bulk changelog response: %w", err)
 			}
 			for _, issue := range page.IssueChangeLogs {
+				if len(issue.ChangeHistories) == 0 {
+					continue
+				}
+				if _, seen := byIssue[issue.IssueID]; seen == false {
+					order = append(order, issue.IssueID)
+				}
 				for _, raw := range issue.ChangeHistories {
-					histories[issue.IssueID] = append(histories[issue.IssueID], raw.toEntry())
+					byIssue[issue.IssueID] = append(byIssue[issue.IssueID], raw.toEntry())
 				}
 			}
 
@@ -150,6 +166,10 @@ func (c *Client) Changelogs(ctx context.Context, keys, fieldIDs []string) (map[s
 			}
 			pageToken = page.NextPageToken
 		}
+	}
+	histories := make([]IssueChangelog, 0, len(order))
+	for _, issueID := range order {
+		histories = append(histories, IssueChangelog{IssueID: issueID, Entries: byIssue[issueID]})
 	}
 	return histories, nil
 }

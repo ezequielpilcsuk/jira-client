@@ -18,7 +18,7 @@ type Priority struct {
 	IsDefault   bool
 }
 
-// PriorityQuery narrows the priority lookup.
+// PriorityQuery narrows the priority lookup. The zero value asks for every priority on the site.
 //
 // Jira Cloud allows more than one priority scheme per site, and schemes are assigned per project, so
 // there is no single global ordering on a multi-scheme site. Pass a ProjectID to get the set that
@@ -40,15 +40,11 @@ type PriorityQuery struct {
 // Jira does not document the ordering of this endpoint, so Rank reflects the returned order rather
 // than a rank the API states. In practice that order is the scheme order; if you need a guarantee,
 // the only endpoint carrying an explicit sequence requires Administer Jira.
-func (c *Client) Priorities(ctx context.Context, query ...PriorityQuery) ([]Priority, error) {
+func (c *Client) Priorities(ctx context.Context, filter PriorityQuery) ([]Priority, error) {
 	var (
 		priorities []Priority
 		startAt    int
-		filter     PriorityQuery
 	)
-	if len(query) > 0 {
-		filter = query[0]
-	}
 
 	for {
 		params := url.Values{}
@@ -105,8 +101,8 @@ func (c *Client) Priorities(ctx context.Context, query ...PriorityQuery) ([]Prio
 //
 // Keyed by name because the name is the only value that works end to end: it is what the API accepts
 // when setting a priority, and what Issue.Priority reports on a read.
-func (c *Client) PriorityRanks(ctx context.Context, query ...PriorityQuery) (map[string]int, error) {
-	priorities, err := c.Priorities(ctx, query...)
+func (c *Client) PriorityRanks(ctx context.Context, filter PriorityQuery) (map[string]int, error) {
+	priorities, err := c.Priorities(ctx, filter)
 	if err != nil {
 		return nil, err
 	}

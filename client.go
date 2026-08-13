@@ -1,14 +1,3 @@
-// Package jiraclient is a Go client for the Jira Cloud REST v3 API, covering the operations an
-// automation typically performs: searching with JQL, reading issues, and mutating them (labels,
-// comments, assignee, summary, status transitions, issue links).
-//
-// It exists so services stop each carrying their own partial Jira integration. Two properties are
-// deliberately first-class because ad-hoc integrations tend to reinvent both:
-//
-//   - DryRun is a client option, not a global. A dry client logs and skips every mutation while
-//     reads still work, so a caller can produce a full plan against production without writing.
-//   - Reads are nil-safe. Jira omits absent fields entirely, and code that dereferences
-//     description/reporter/assignee unconditionally panics on real tickets.
 package jiraclient
 
 import (
@@ -38,6 +27,11 @@ const (
 	// prioritySearchPageSize is the page size for /priority/search, whose own default is 50.
 	prioritySearchPageSize = 100
 )
+
+// DryRunID is the placeholder identifier that creating calls return on a dry-run client. Nothing was
+// created, so feeding it back into a later mutation is itself a no-op. Compare against this rather
+// than the literal, which is what makes a dry plan inspectable.
+const DryRunID = "DRY-RUN"
 
 // Logger is the minimal logging surface the client needs. It matches the shape of most structured
 // loggers closely enough to adapt in a line, and keeps this library free of a logging dependency.
@@ -136,29 +130,62 @@ func (c *Client) skipMutation(operation string, args ...any) bool {
 	return true
 }
 
+// request describes one HTTP call. Everything except Method and Path is optional, and the zero value
+// produces the JSON request that almost every endpoint wants.
+type request struct {
+	Method string
+	Path   string
+	// Payload is JSON-marshalled. Mutually exclusive with Body.
+	Payload any
+	// Body is sent verbatim, for endpoints that do not take JSON — attachment upload is multipart.
+	// It is buffered so a retry can replay it.
+	Body []byte
+	// ContentType overrides application/json. Required whenever Body is set.
+	ContentType string
+	// Accept overrides application/json, e.g. for a binary download.
+	Accept string
+	// Headers are set on the request, after the defaults above.
+	Headers map[string]string
+	// NoRedirect returns the 3xx response instead of following it. Jira answers attachment downloads
+	// with a 303 to a media host, and Go strips Authorization across hosts, so following it in-client
+	// would fail auth — the caller needs the Location instead.
+	NoRedirect bool
+}
+
 // do performs a request, retrying rate-limited and transient failures per the retry policy.
 func (c *Client) do(ctx context.Context, method, path string, payload any) ([]byte, error) {
-	var encoded []byte
-	if payload != nil {
+	body, _, err := c.doRequest(ctx, request{Method: method, Path: path, Payload: payload})
+	return body, err
+}
+
+// doRequest is do with full control over the request, returning the response headers alongside the
+// body. Reach for it only when an endpoint departs from the JSON-in/JSON-out norm.
+func (c *Client) doRequest(ctx context.Context, req request) ([]byte, http.Header, error) {
+	if req.Payload != nil && req.Body != nil {
+		return nil, nil, fmt.Errorf("%w: a request carries either Payload or Body, not both", ErrInvalidArgument)
+	}
+
+	encoded := req.Body
+	if req.Payload != nil {
 		var err error
-		if encoded, err = json.Marshal(payload); err != nil {
-			return nil, fmt.Errorf("marshal %s %s: %w", method, path, err)
+		if encoded, err = json.Marshal(req.Payload); err != nil {
+			return nil, nil, fmt.Errorf("marshal %s %s: %w", req.Method, req.Path, err)
 		}
 	}
 
 	for attempt := 1; ; attempt++ {
-		body, err := c.attempt(ctx, method, path, encoded)
+		body, header, err := c.attempt(ctx, req, encoded)
 		if err == nil {
-			return body, nil
+			return body, header, nil
 		}
 
 		delay, retry := c.shouldRetry(err, attempt)
 		if retry == false {
-			return nil, err
+			return nil, nil, err
 		}
-		c.logf("jira %s %s failed (attempt %d), retrying in %s: %v", method, path, attempt, delay, err)
+		c.logf("jira %s %s failed (attempt %d), retrying in %s: %v", req.Method, req.Path, attempt, delay, err)
 		if sleepErr := sleep(ctx, delay); sleepErr != nil {
-			return nil, sleepErr
+			return nil, nil, sleepErr
 		}
 	}
 }
@@ -166,40 +193,63 @@ func (c *Client) do(ctx context.Context, method, path string, payload any) ([]by
 // attempt performs one request. A non-2xx response becomes an *APIError carrying the status and
 // Jira's own message, which is where the useful detail lives (a 400 from a bad ADF document names
 // the node it rejected).
-func (c *Client) attempt(ctx context.Context, method, path string, payload []byte) ([]byte, error) {
+func (c *Client) attempt(ctx context.Context, spec request, payload []byte) ([]byte, http.Header, error) {
 	var body io.Reader
 	if payload != nil {
 		body = bytes.NewReader(payload)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
+	req, err := http.NewRequestWithContext(ctx, spec.Method, c.baseURL+spec.Path, body)
 	if err != nil {
-		return nil, fmt.Errorf("build request %s %s: %w", method, path, err)
+		return nil, nil, fmt.Errorf("build request %s %s: %w", spec.Method, spec.Path, err)
 	}
-	req.Header.Set(headerAccept, contentTypeJSON)
-	req.Header.Set(headerContentType, contentTypeJSON)
+
+	accept := spec.Accept
+	if accept == "" {
+		accept = contentTypeJSON
+	}
+	contentType := spec.ContentType
+	if contentType == "" {
+		contentType = contentTypeJSON
+	}
+	req.Header.Set(headerAccept, accept)
+	req.Header.Set(headerContentType, contentType)
+	for name, value := range spec.Headers {
+		req.Header.Set(name, value)
+	}
 	req.SetBasicAuth(c.email, c.apiToken)
 
-	resp, err := c.httpClient.Do(req)
+	httpClient := c.httpClient
+	if spec.NoRedirect == true {
+		// A shallow copy: the shared client's CheckRedirect must not be mutated, and callers may have
+		// supplied their own client via WithHTTPClient.
+		noFollow := *c.httpClient
+		noFollow.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+		httpClient = &noFollow
+	}
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", method, path, err)
+		return nil, nil, fmt.Errorf("%s %s: %w", spec.Method, spec.Path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response %s %s: %w", method, path, err)
+		return nil, nil, fmt.Errorf("read response %s %s: %w", spec.Method, spec.Path, err)
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		apiErr := newAPIError(resp.StatusCode, method+" "+path, responseBody)
+	// A 3xx is a success for a caller that asked not to follow it; the Location is the answer.
+	redirected := spec.NoRedirect == true && resp.StatusCode >= 300 && resp.StatusCode <= 399
+	if redirected == false && (resp.StatusCode < 200 || resp.StatusCode > 299) {
+		apiErr := newAPIError(resp.StatusCode, spec.Method+" "+spec.Path, responseBody)
 		apiErr.RetryAfter = parseRetryAfter(resp.Header)
 		apiErr.RateLimitReason = resp.Header.Get("RateLimit-Reason")
 		apiErr.RateLimitReset = parseRateLimitReset(resp.Header)
 		apiErr.NearLimit = resp.Header.Get("X-RateLimit-NearLimit") == "true"
-		return nil, apiErr
+		return nil, resp.Header, apiErr
 	}
-	return responseBody, nil
+	return responseBody, resp.Header, nil
 }
 
 // buildPath joins the API base with a path and query values.

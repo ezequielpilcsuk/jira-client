@@ -22,7 +22,7 @@ func TestSearch_FlattensCommentBodies(t *testing.T) {
 			]}}}],"isLast":true}`)
 	})
 
-	issues, err := client.Search(context.Background(), "project = ABC", []string{"summary", "comment"})
+	issues, err := client.SearchIssues(context.Background(), "project = ABC", []string{"summary", "comment"})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -51,7 +51,7 @@ func TestSearch_MissingCommentFieldIsNotAnError(t *testing.T) {
 		_, _ = io.WriteString(w, `{"issues":[{"key":"ABC-1","fields":{"summary":"one"}}],"isLast":true}`)
 	})
 
-	issues, err := client.Search(context.Background(), "project = ABC", nil)
+	issues, err := client.SearchIssues(context.Background(), "project = ABC", nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}

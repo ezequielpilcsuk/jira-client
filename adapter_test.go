@@ -43,7 +43,7 @@ type adapter struct {
 }
 
 func (a adapter) SearchIssues(jql string) ([]Issue, error) {
-	return a.client.Search(a.ctx, jql, nil)
+	return a.client.SearchIssues(a.ctx, jql, nil)
 }
 
 func (a adapter) UpdateSummary(key, summary string) error {
@@ -66,8 +66,11 @@ func (a adapter) AddLabel(key, label string) error {
 	return a.client.AddLabel(a.ctx, key, label)
 }
 
+// The consumer does not want the created comment back, so the adapter drops it. That one line is the
+// entire migration cost of AddComment/AddTextComment returning what they created.
 func (a adapter) AddComment(key, comment string) error {
-	return a.client.AddTextComment(a.ctx, key, comment)
+	_, err := a.client.AddTextComment(a.ctx, key, comment)
+	return err
 }
 
 // Compile-time proof that the library satisfies the consumer's interface through the adapter.

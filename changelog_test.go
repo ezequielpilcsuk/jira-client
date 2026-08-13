@@ -215,12 +215,20 @@ func TestChangelogs_FollowsNextPageTokenAndKeysByIssueID(t *testing.T) {
 	if len(requestedTokens) != 2 || requestedTokens[1] != "page2" {
 		t.Fatalf("pagination tokens: %v", requestedTokens)
 	}
-	// Entries for one issue must accumulate across pages rather than the later page replacing the first.
-	if len(histories["10001"]) != 2 || len(histories["10002"]) != 1 {
-		t.Fatalf("histories: %+v", histories)
+	// One issue's history can span pages, and both halves must land in a single entry rather than the
+	// issue appearing twice.
+	if len(histories) != 2 {
+		t.Fatalf("got %d issues, want 2: %+v", len(histories), histories)
 	}
-	if histories["10001"][0].ID != "1" || histories["10001"][1].ID != "2" {
-		t.Errorf("entries out of order: %+v", histories["10001"])
+	first, second := histories[0], histories[1]
+	if first.IssueID != "10001" || len(first.Entries) != 2 {
+		t.Fatalf("first issue not accumulated across pages: %+v", first)
+	}
+	if second.IssueID != "10002" || len(second.Entries) != 1 {
+		t.Fatalf("second issue wrong: %+v", second)
+	}
+	if first.Entries[0].ID != "1" || first.Entries[1].ID != "2" {
+		t.Errorf("entries out of order: %+v", first.Entries)
 	}
 }
 

@@ -24,19 +24,17 @@ const (
 // maxReconcileIssues is Jira's cap on the reconcileIssues parameter.
 const maxReconcileIssues = 50
 
-// Search runs a JQL query and returns every matching issue, following Jira's pagination to the end.
-// Pass nil fields to use SearchFields.
-//
-// The result set is unbounded — a broad JQL over a large project returns everything. Narrow the JQL
-// rather than relying on a limit.
-//
-// ⚠️ Search reads an index that is only eventually consistent. After a write, a search can return
-// stale data or miss the issue entirely, for anything from seconds to minutes. If you are searching
-// for issues you just created or changed, use SearchReconciled with their IDs, or read them directly
-// with GetIssue/GetIssues, which are strongly consistent.
-func (c *Client) Search(ctx context.Context, jql string, fields []string) ([]Issue, error) {
-	result, err := c.search(ctx, jql, fields, nil)
-	return result.Issues, err
+// SearchQuery describes a JQL search. The zero value beyond JQL is the common case.
+type SearchQuery struct {
+	// JQL is the query. Required.
+	JQL string
+	// Fields limits what is fetched. Empty uses SearchFields, which is what you almost always want —
+	// a full-fidelity fetch of a few thousand issues is dramatically larger and slower.
+	Fields []string
+	// ReconcileIssues names numeric issue IDs (Issue.ID, not keys) that Jira must reconcile before
+	// answering, giving read-after-write consistency for those issues only. Jira accepts at most 50.
+	// Leave empty unless you are searching for something you just wrote.
+	ReconcileIssues []string
 }
 
 // SearchResult is a search's issues plus anything Jira wanted to say about the query itself.
@@ -45,22 +43,34 @@ type SearchResult struct {
 	// Warnings are Jira's complaints about the JQL — an unrecognised field, a value it could not
 	// resolve. A warned query still returns 200 with an empty result set, so without these a JQL that
 	// matched nothing *because it was wrong* is indistinguishable from one that legitimately did.
+	// Worth checking whenever a search returns fewer issues than expected.
 	Warnings []string
 }
 
-// SearchReconciled is Search with read-after-write consistency for specific issues.
+// Search runs a JQL query and returns every matching issue, following Jira's pagination to the end.
 //
-// Pass the IDs of issues you just wrote. Jira reconciles those before answering, so a search run
-// immediately after a create or update sees them. Consistency is guaranteed only for the IDs given —
-// the rest of the result set is still eventually consistent. Jira accepts at most 50.
+// The result set is unbounded — a broad JQL over a large project returns everything. Narrow the JQL
+// rather than relying on a limit.
 //
-// The IDs are numeric issue IDs, not keys. Issue.ID carries them.
-func (c *Client) SearchReconciled(ctx context.Context, jql string, fields []string, issueIDs []string) (SearchResult, error) {
-	if len(issueIDs) > maxReconcileIssues {
+// ⚠️ Search reads an index that is only eventually consistent. After a write, it can return stale
+// data or miss the issue entirely, for anything from seconds to minutes. To search for issues you
+// just wrote, set SearchQuery.ReconcileIssues; to read known issues, use GetIssue or GetIssues,
+// which bypass the index entirely.
+func (c *Client) Search(ctx context.Context, query SearchQuery) (SearchResult, error) {
+	if len(query.ReconcileIssues) > maxReconcileIssues {
 		return SearchResult{}, fmt.Errorf("%w: at most %d issues can be reconciled, got %d",
-			ErrInvalidArgument, maxReconcileIssues, len(issueIDs))
+			ErrInvalidArgument, maxReconcileIssues, len(query.ReconcileIssues))
 	}
-	return c.search(ctx, jql, fields, issueIDs)
+	return c.search(ctx, query.JQL, query.Fields, query.ReconcileIssues)
+}
+
+// SearchIssues is Search for the common case: a query, and only the issues back.
+//
+// It discards SearchResult.Warnings, so a JQL Jira objected to looks the same as one that matched
+// nothing. Reach for Search when an empty result would be surprising.
+func (c *Client) SearchIssues(ctx context.Context, jql string, fields []string) ([]Issue, error) {
+	result, err := c.Search(ctx, SearchQuery{JQL: jql, Fields: fields})
+	return result.Issues, err
 }
 
 func (c *Client) search(ctx context.Context, jql string, fields, reconcileIDs []string) (SearchResult, error) {
@@ -198,7 +208,7 @@ type CreateIssueInput struct {
 	CustomFields map[string]any
 }
 
-// CreateIssue opens an issue and returns its key. In dry-run mode it returns "DRY-RUN" and creates
+// CreateIssue opens an issue and returns its key. In dry-run mode it returns DryRunID and creates
 // nothing.
 func (c *Client) CreateIssue(ctx context.Context, input CreateIssueInput) (string, error) {
 	if input.ProjectKey == "" || input.IssueType == "" || strings.TrimSpace(input.Summary) == "" {
@@ -209,7 +219,7 @@ func (c *Client) CreateIssue(ctx context.Context, input CreateIssueInput) (strin
 			ErrInvalidArgument, len(input.Summary), SummaryMaxChars)
 	}
 	if c.skipMutation("CreateIssue", input.ProjectKey, input.Summary) == true {
-		return "DRY-RUN", nil
+		return DryRunID, nil
 	}
 
 	fields := map[string]any{
@@ -250,7 +260,6 @@ func (c *Client) CreateIssue(ctx context.Context, input CreateIssueInput) (strin
 	return created.Key, nil
 }
 
-// UpdateSummary replaces an issue's summary.
 // DeleteIssue permanently removes an issue. Jira does not undo this, so it exists mainly for tests
 // that file real tickets and have to clean up after themselves.
 func (c *Client) DeleteIssue(ctx context.Context, key string) error {
@@ -346,28 +355,11 @@ func (c *Client) changeLabel(ctx context.Context, key, label, operation string) 
 	return err
 }
 
-// AddComment posts a comment built from an ADF document.
-func (c *Client) AddComment(ctx context.Context, key string, doc *ADFDoc) error {
-	if key == "" {
-		return fmt.Errorf("%w: issue key cannot be empty", ErrInvalidArgument)
-	}
-	if doc == nil || len(doc.Content) == 0 {
-		return fmt.Errorf("%w: %v", ErrInvalidArgument, errEmptyDoc)
-	}
-	if c.skipMutation("AddComment", key) == true {
-		return nil
-	}
-
-	_, err := c.do(ctx, "POST", apiBase+"/issue/"+url.PathEscape(key)+"/comment",
-		map[string]any{"body": doc})
-	return err
-}
-
 // AddTextComment posts a plain-text comment. "[@accountId]" becomes a real mention.
-func (c *Client) AddTextComment(ctx context.Context, key, text string) error {
+func (c *Client) AddTextComment(ctx context.Context, key, text string) (Comment, error) {
 	doc, err := TextDoc(text)
 	if err != nil {
-		return err
+		return Comment{}, err
 	}
 	return c.AddComment(ctx, key, doc)
 }

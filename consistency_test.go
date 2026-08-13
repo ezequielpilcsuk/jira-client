@@ -92,7 +92,7 @@ func TestGetIssues_MissingKeysAreSimplyAbsent(t *testing.T) {
 	}
 }
 
-func TestSearchReconciled(t *testing.T) {
+func TestSearchReconciled_ReadAfterWrite(t *testing.T) {
 	t.Run("passes the ids on every page", func(t *testing.T) {
 		var perPageIDs [][]string
 		client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
@@ -104,8 +104,7 @@ func TestSearchReconciled(t *testing.T) {
 			_, _ = io.WriteString(w, `{"issues":[],"isLast":true}`)
 		})
 
-		if _, err := client.SearchReconciled(context.Background(), "project = ABC", nil,
-			[]string{"10001", "10002"}); err != nil {
+		if _, err := client.Search(context.Background(), SearchQuery{JQL: "project = ABC", ReconcileIssues: []string{"10001", "10002"}}); err != nil {
 			t.Fatalf("search: %v", err)
 		}
 
@@ -126,7 +125,7 @@ func TestSearchReconciled(t *testing.T) {
 		})
 
 		ids := make([]string, 51)
-		_, err := client.SearchReconciled(context.Background(), "project = ABC", nil, ids)
+		_, err := client.Search(context.Background(), SearchQuery{JQL: "project = ABC", ReconcileIssues: ids})
 		if errors.Is(err, ErrInvalidArgument) == false {
 			t.Errorf("want ErrInvalidArgument, got %v", err)
 		}
@@ -141,7 +140,7 @@ func TestSearch_SurfacesWarnings(t *testing.T) {
 			"warnings":[{"message":"The value 'nope' does not exist for the field 'status'."}]}`)
 	})
 
-	result, err := client.SearchReconciled(context.Background(), "status = nope", nil, nil)
+	result, err := client.Search(context.Background(), SearchQuery{JQL: "status = nope"})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -159,7 +158,7 @@ func TestSearch_DecodesLegacyWarningShape(t *testing.T) {
 		_, _ = io.WriteString(w, `{"issues":[],"isLast":true,"warningMessages":["legacy warning"]}`)
 	})
 
-	result, err := client.SearchReconciled(context.Background(), "project = ABC", nil, nil)
+	result, err := client.Search(context.Background(), SearchQuery{JQL: "project = ABC"})
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
