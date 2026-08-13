@@ -22,11 +22,13 @@ type User struct {
 // larger page only costs bandwidth.
 const userSearchLimit = 10
 
-// SearchUsers finds accounts matching a query, which Jira matches against display name and — for
-// accounts whose profile permits it — email address.
+// SearchUsers finds accounts matching a query, which Jira matches as a *prefix* against display name
+// and — for accounts whose profile permits it — email address.
 //
-// Jira's visibility rules apply: an account whose email is private will not match on email even when
-// the address is correct, so an empty result is not proof that the person has no account.
+// Three things make an empty result ambiguous, and none of them is distinguishable from "no such
+// person": Jira returns only **active** users, so a deactivated account never appears; profile
+// visibility can hide an email so the address will not match even when it is correct; and a caller
+// without the *Browse users and groups* permission gets an empty list rather than a 403.
 func (c *Client) SearchUsers(ctx context.Context, query string) ([]User, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("%w: query cannot be empty", ErrInvalidArgument)
@@ -68,6 +70,13 @@ func (c *Client) SearchUsers(ctx context.Context, query string) ([]User, error) 
 // AccountIDByEmail resolves an email address to a single account id, returning "" when nothing
 // matches. A caller that cannot resolve a reporter generally wants to carry on without one rather
 // than fail, so "not found" is not an error here.
+//
+// Jira matches the query as a *prefix*, so "ada@example.com" also matches "ada@example.com.au". An
+// exact, case-insensitive match on a visible email always wins. Only when no candidate exposes an
+// email at all — the common case under restrictive profile visibility — does this fall back to the
+// first result, which is a guess and can be wrong if the address is a prefix of another.
+//
+// See SearchUsers for why an empty result does not prove the person has no account.
 func (c *Client) AccountIDByEmail(ctx context.Context, email string) (string, error) {
 	if strings.TrimSpace(email) == "" {
 		return "", nil
@@ -78,6 +87,23 @@ func (c *Client) AccountIDByEmail(ctx context.Context, email string) (string, er
 		return "", err
 	}
 	if len(users) == 0 {
+		return "", nil
+	}
+
+	anyEmailVisible := false
+	for _, user := range users {
+		if user.Email == "" {
+			continue
+		}
+		anyEmailVisible = true
+		if strings.EqualFold(user.Email, email) == true {
+			return user.AccountID, nil
+		}
+	}
+
+	// Every candidate matched on something other than a visible email — a display name, or an email
+	// Jira declined to show. There is nothing to verify against, so the top match is the best guess.
+	if anyEmailVisible == true {
 		return "", nil
 	}
 	return users[0].AccountID, nil

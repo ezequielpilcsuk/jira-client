@@ -4,25 +4,78 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 )
 
-// liveSchemeResponse is a real /rest/api/3/priority body from a site whose scheme was customised
+// liveSchemeResponse is a /rest/api/3/priority/search body from a site whose scheme was customised
 // after creation: "Normal" was added later, so it carries a 10000-series ID while ranking third.
-const liveSchemeResponse = `[
+const liveSchemeResponse = `{"isLast":true,"values":[
 	{"id":"1","name":"Blocker"},
 	{"id":"2","name":"Critical"},
 	{"id":"3","name":"Major"},
 	{"id":"10000","name":"Normal"},
 	{"id":"4","name":"Minor"},
 	{"id":"5","name":"Trivial"}
-]`
+]}`
+
+// The plain /rest/api/3/priority endpoint is deprecated, so the client must be on /priority/search.
+func TestPriorities_UsesTheNonDeprecatedEndpoint(t *testing.T) {
+	var requestedPath string
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.Path
+		_, _ = io.WriteString(w, liveSchemeResponse)
+	})
+
+	if _, err := client.Priorities(context.Background()); err != nil {
+		t.Fatalf("priorities: %v", err)
+	}
+	if requestedPath != "/rest/api/3/priority/search" {
+		t.Errorf("got %q, want the /priority/search endpoint", requestedPath)
+	}
+}
+
+// Priorities are per-scheme on Jira Cloud, so a project scopes the lookup to the set that applies.
+func TestPriorities_ScopesByProject(t *testing.T) {
+	var requestedQuery string
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requestedQuery = r.URL.RawQuery
+		_, _ = io.WriteString(w, liveSchemeResponse)
+	})
+
+	if _, err := client.Priorities(context.Background(), PriorityQuery{ProjectID: "10001"}); err != nil {
+		t.Fatalf("priorities: %v", err)
+	}
+	if strings.Contains(requestedQuery, "projectId=10001") == false {
+		t.Errorf("project not passed through: %s", requestedQuery)
+	}
+}
+
+func TestPriorities_FollowsPagination(t *testing.T) {
+	var calls int
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.URL.Query().Get("startAt") == "0" {
+			_, _ = io.WriteString(w, `{"isLast":false,"values":[{"id":"1","name":"Blocker"}]}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"isLast":true,"values":[{"id":"2","name":"Critical"}]}`)
+	})
+
+	priorities, err := client.Priorities(context.Background())
+	if err != nil {
+		t.Fatalf("priorities: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("got %d requests, want 2", calls)
+	}
+	if len(priorities) != 2 || priorities[1].Name != "Critical" || priorities[1].Rank != 1 {
+		t.Errorf("pages not accumulated in order: %+v", priorities)
+	}
+}
 
 func TestPriorities_RanksInResponseOrderNotByID(t *testing.T) {
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/rest/api/3/priority" {
-			t.Errorf("unexpected path %q", r.URL.Path)
-		}
 		_, _ = io.WriteString(w, liveSchemeResponse)
 	})
 
@@ -73,7 +126,7 @@ func TestPriorityRanks_NormalOutranksMinorDespiteHigherID(t *testing.T) {
 
 func TestPriorities_EmptySchemeIsAnError(t *testing.T) {
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `[]`)
+		_, _ = io.WriteString(w, `{"isLast":true,"values":[]}`)
 	})
 
 	if _, err := client.Priorities(context.Background()); err == nil {

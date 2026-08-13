@@ -21,41 +21,89 @@ const (
 	LinkClones    = "Cloners"
 )
 
+// maxReconcileIssues is Jira's cap on the reconcileIssues parameter.
+const maxReconcileIssues = 50
+
 // Search runs a JQL query and returns every matching issue, following Jira's pagination to the end.
 // Pass nil fields to use SearchFields.
 //
 // The result set is unbounded — a broad JQL over a large project returns everything. Narrow the JQL
 // rather than relying on a limit.
+//
+// ⚠️ Search reads an index that is only eventually consistent. After a write, a search can return
+// stale data or miss the issue entirely, for anything from seconds to minutes. If you are searching
+// for issues you just created or changed, use SearchReconciled with their IDs, or read them directly
+// with GetIssue/GetIssues, which are strongly consistent.
 func (c *Client) Search(ctx context.Context, jql string, fields []string) ([]Issue, error) {
+	result, err := c.search(ctx, jql, fields, nil)
+	return result.Issues, err
+}
+
+// SearchResult is a search's issues plus anything Jira wanted to say about the query itself.
+type SearchResult struct {
+	Issues []Issue
+	// Warnings are Jira's complaints about the JQL — an unrecognised field, a value it could not
+	// resolve. A warned query still returns 200 with an empty result set, so without these a JQL that
+	// matched nothing *because it was wrong* is indistinguishable from one that legitimately did.
+	Warnings []string
+}
+
+// SearchReconciled is Search with read-after-write consistency for specific issues.
+//
+// Pass the IDs of issues you just wrote. Jira reconciles those before answering, so a search run
+// immediately after a create or update sees them. Consistency is guaranteed only for the IDs given —
+// the rest of the result set is still eventually consistent. Jira accepts at most 50.
+//
+// The IDs are numeric issue IDs, not keys. Issue.ID carries them.
+func (c *Client) SearchReconciled(ctx context.Context, jql string, fields []string, issueIDs []string) (SearchResult, error) {
+	if len(issueIDs) > maxReconcileIssues {
+		return SearchResult{}, fmt.Errorf("%w: at most %d issues can be reconciled, got %d",
+			ErrInvalidArgument, maxReconcileIssues, len(issueIDs))
+	}
+	return c.search(ctx, jql, fields, issueIDs)
+}
+
+func (c *Client) search(ctx context.Context, jql string, fields, reconcileIDs []string) (SearchResult, error) {
 	if strings.TrimSpace(jql) == "" {
-		return nil, fmt.Errorf("%w: jql cannot be empty", ErrInvalidArgument)
+		return SearchResult{}, fmt.Errorf("%w: jql cannot be empty", ErrInvalidArgument)
 	}
 	if len(fields) == 0 {
 		fields = SearchFields
 	}
 
-	var issues []Issue
+	var result SearchResult
+	seenWarning := map[string]bool{}
 	pageToken := ""
 	for {
 		query := url.Values{}
 		query.Set("jql", jql)
 		query.Set("maxResults", strconv.Itoa(c.pageSize))
 		query.Set("fields", strings.Join(fields, ","))
+		// Reconciliation is re-sent on every page: it qualifies the query, not one response.
+		for _, id := range reconcileIDs {
+			query.Add("reconcileIssues", id)
+		}
 		if pageToken != "" {
 			query.Set("nextPageToken", pageToken)
 		}
 
 		body, err := c.do(ctx, "GET", buildPath("/search/jql", query), nil)
 		if err != nil {
-			return nil, err
+			return SearchResult{}, err
 		}
 
 		var page searchResponse
 		if err := json.Unmarshal(body, &page); err != nil {
-			return nil, fmt.Errorf("decode search response: %w", err)
+			return SearchResult{}, fmt.Errorf("decode search response: %w", err)
 		}
 		for _, raw := range page.Issues {
-			issues = append(issues, raw.toIssue())
+			result.Issues = append(result.Issues, raw.toIssue())
+		}
+		for _, warning := range page.warnings() {
+			if seenWarning[warning] == false {
+				seenWarning[warning] = true
+				result.Warnings = append(result.Warnings, warning)
+			}
 		}
 
 		if page.IsLast == true || page.NextPageToken == "" {
@@ -63,7 +111,7 @@ func (c *Client) Search(ctx context.Context, jql string, fields []string) ([]Iss
 		}
 		pageToken = page.NextPageToken
 	}
-	return issues, nil
+	return result, nil
 }
 
 // GetIssue fetches a single issue by key or ID.
@@ -90,23 +138,46 @@ func (c *Client) GetIssue(ctx context.Context, key string, fields []string) (Iss
 	return raw.toIssue(), nil
 }
 
-// GetIssues fetches issues by key in batches, which is far cheaper than one request each. Keys are
-// chunked so the generated JQL cannot grow unbounded.
-func (c *Client) GetIssues(ctx context.Context, keys []string, fields []string) (map[string]Issue, error) {
-	issues := make(map[string]Issue, len(keys))
-	const chunkSize = 100
+// bulkFetchChunk is Jira's cap on issues per /issue/bulkfetch request.
+const bulkFetchChunk = 100
 
-	for start := 0; start < len(keys); start += chunkSize {
-		end := start + chunkSize
+// GetIssues fetches issues by key or ID in batches, which is far cheaper than one request each.
+//
+// It reads issues directly rather than searching for them, so unlike Search it is strongly
+// consistent: an issue created a moment ago is returned. Keys are matched case-insensitively, and a
+// key that has been moved resolves to the issue's current identity.
+//
+// Keys that do not exist, or that the caller cannot see, are simply absent from the map — Jira
+// reports them per-key rather than failing the batch, and the two cases are not distinguishable.
+func (c *Client) GetIssues(ctx context.Context, keys []string, fields []string) (map[string]Issue, error) {
+	if len(fields) == 0 {
+		fields = SearchFields
+	}
+
+	issues := make(map[string]Issue, len(keys))
+	for start := 0; start < len(keys); start += bulkFetchChunk {
+		end := start + bulkFetchChunk
 		if end > len(keys) {
 			end = len(keys)
 		}
-		jql := fmt.Sprintf("key IN (%s)", strings.Join(keys[start:end], ", "))
-		page, err := c.Search(ctx, jql, fields)
+
+		payload := map[string]any{
+			"issueIdsOrKeys": keys[start:end],
+			"fields":         fields,
+		}
+		body, err := c.do(ctx, "POST", apiBase+"/issue/bulkfetch", payload)
 		if err != nil {
 			return nil, err
 		}
-		for _, issue := range page {
+
+		var decoded struct {
+			Issues []rawIssue `json:"issues"`
+		}
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			return nil, fmt.Errorf("decode bulk fetch response: %w", err)
+		}
+		for _, raw := range decoded.Issues {
+			issue := raw.toIssue()
 			issues[issue.Key] = issue
 		}
 	}

@@ -14,8 +14,16 @@ var (
 	// ErrNotFound is returned when an issue or resource does not exist.
 	ErrNotFound = errors.New("jira resource not found")
 
-	// ErrUnauthorized is returned for 401/403 — bad credentials, or a token without the scope.
+	// ErrUnauthorized is returned for 401/403 — bad credentials, a token without the scope, or an
+	// API token that has expired. Jira Cloud tokens now carry an expiry (1 year by default), so a
+	// 401 on a call that used to work usually means the token needs reissuing rather than that the
+	// permissions changed.
 	ErrUnauthorized = errors.New("jira request not authorized")
+
+	// ErrLimitExceeded is returned on 413, which Jira uses for its per-issue entity ceilings —
+	// 5,000 comments or worklogs, 2,000 attachments or links on one issue. Unlike a rate limit this
+	// is permanent: retrying never clears it, so the caller has to change what it is doing.
+	ErrLimitExceeded = errors.New("jira entity limit exceeded")
 
 	// ErrRateLimited is returned on 429. Jira rate-limits aggressively; back off and retry.
 	ErrRateLimited = errors.New("jira rate limit exceeded")
@@ -55,6 +63,8 @@ func (e *APIError) Unwrap() error {
 		return ErrUnauthorized
 	case http.StatusTooManyRequests:
 		return ErrRateLimited
+	case http.StatusRequestEntityTooLarge:
+		return ErrLimitExceeded
 	}
 	return nil
 }

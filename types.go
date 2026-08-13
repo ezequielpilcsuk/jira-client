@@ -64,6 +64,23 @@ type searchResponse struct {
 	Issues        []rawIssue `json:"issues"`
 	IsLast        bool       `json:"isLast"`
 	NextPageToken string     `json:"nextPageToken,omitempty"`
+	// Warnings is the /search/jql shape; WarningMessages is what the retired /search returned. Both
+	// are decoded so the complaint surfaces either way.
+	Warnings []struct {
+		Message string `json:"message"`
+	} `json:"warnings"`
+	WarningMessages []string `json:"warningMessages"`
+}
+
+// warnings flattens whichever warning shape the site returned.
+func (s searchResponse) warnings() []string {
+	messages := make([]string, 0, len(s.Warnings)+len(s.WarningMessages))
+	for _, warning := range s.Warnings {
+		if warning.Message != "" {
+			messages = append(messages, warning.Message)
+		}
+	}
+	return append(messages, s.WarningMessages...)
 }
 
 // rawIssue mirrors Jira's issue payload. Every nested object is a pointer because Jira omits fields
@@ -110,8 +127,19 @@ type rawUser struct {
 	Active      bool   `json:"active"`
 }
 
-// jiraTimeLayout is the timestamp format Jira returns, e.g. "2026-08-11T13:00:32.478-0700".
-const jiraTimeLayout = "2006-01-02T15:04:05.000-0700"
+// jiraTimeLayouts are the timestamp formats accepted, most common first.
+//
+// Jira documents only "ISO 8601, in the system default user time zone" and in practice returns
+// "2026-08-11T13:00:32.478-0700". Nothing guarantees the fractional-second precision or the offset
+// style, and a mismatch here is silent — the field decodes to the zero time with no error — so the
+// stricter layout is tried first and the standard ones catch anything else.
+var jiraTimeLayouts = []string{
+	"2006-01-02T15:04:05.000-0700",
+	time.RFC3339Nano,
+	time.RFC3339,
+	"2006-01-02T15:04:05-0700",
+	"2006-01-02",
+}
 
 // toIssue flattens a raw issue, tolerating every absent field.
 func (r rawIssue) toIssue() Issue {
@@ -166,9 +194,10 @@ func parseJiraTime(raw string) time.Time {
 	if raw == "" {
 		return time.Time{}
 	}
-	parsed, err := time.Parse(jiraTimeLayout, raw)
-	if err != nil {
-		return time.Time{}
+	for _, layout := range jiraTimeLayouts {
+		if parsed, err := time.Parse(layout, raw); err == nil {
+			return parsed
+		}
 	}
-	return parsed
+	return time.Time{}
 }
