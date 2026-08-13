@@ -20,9 +20,8 @@ import (
 //   - adjustEstimate accepts a different set of values on each verb, and the difference is not
 //     visible from any one endpoint's reference page. It is encoded as local validation below.
 //
-// An issue holds at most 5,000 worklogs. Past that Jira answers 413, which arrives as
-// ErrLimitExceeded — a permanent per-issue ceiling rather than a rate limit, so retrying never
-// clears it.
+// An issue holds at most 5,000 worklogs; past that Jira answers 413, which arrives as
+// ErrLimitExceeded.
 
 const (
 	// worklogPageSize is the page size requested when listing. It matches both this endpoint's own

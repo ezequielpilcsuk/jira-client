@@ -100,10 +100,10 @@ func (r rawComment) toComment() Comment {
 // are accepted, so an unknown order is refused locally rather than spent on a certain 400.
 //
 // Two limits are worth knowing about. An issue holds at most 5,000 comments, and a write past that
-// ceiling returns 413 — surfaced here as ErrLimitExceeded, which unlike a rate limit never clears by
-// retrying. And jsdPublic, the flag deciding whether a Jira Service Management comment is visible to
-// the customer or internal, is read-only on this API: it can only be set through the Service Desk
-// API, so this endpoint cannot make a comment customer-facing.
+// ceiling returns 413, which arrives as ErrLimitExceeded. And jsdPublic, the flag deciding whether a
+// Jira Service Management comment is visible to the customer or internal, is read-only on this API:
+// it can only be set through the Service Desk API, so this endpoint cannot make a comment
+// customer-facing.
 func (c *Client) Comments(ctx context.Context, key string, sort CommentOrder) ([]Comment, error) {
 	if key == "" {
 		return nil, fmt.Errorf("%w: issue key cannot be empty", ErrInvalidArgument)

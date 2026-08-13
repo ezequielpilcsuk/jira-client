@@ -273,6 +273,8 @@ func (c *Client) DeleteIssue(ctx context.Context, key string) error {
 	return err
 }
 
+// UpdateSummary replaces an issue's summary. Jira rejects anything over SummaryMaxChars outright,
+// taking the whole edit with it, so an over-long summary is refused here instead.
 func (c *Client) UpdateSummary(ctx context.Context, key, summary string) error {
 	if key == "" || strings.TrimSpace(summary) == "" {
 		return fmt.Errorf("%w: key and summary are required", ErrInvalidArgument)

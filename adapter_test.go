@@ -66,8 +66,7 @@ func (a adapter) AddLabel(key, label string) error {
 	return a.client.AddLabel(a.ctx, key, label)
 }
 
-// The consumer does not want the created comment back, so the adapter drops it. That one line is the
-// entire migration cost of AddComment/AddTextComment returning what they created.
+// The consumer does not want the created comment back, so the adapter drops it.
 func (a adapter) AddComment(key, comment string) error {
 	_, err := a.client.AddTextComment(a.ctx, key, comment)
 	return err

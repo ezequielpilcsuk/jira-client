@@ -135,8 +135,8 @@ func (c *Client) RemoteLinks(ctx context.Context, key string) ([]RemoteLink, err
 // request are set to null", so a later call carrying only URL and Title clears the summary, icon,
 // relationship and resolved flag an earlier one set. Send the whole intended state every time.
 //
-// An issue holds at most 2,000 remote links. Beyond that Jira answers 413, which arrives as
-// ErrLimitExceeded — a permanent ceiling rather than a rate limit, so retrying never clears it.
+// An issue holds at most 2,000 remote links; beyond that Jira answers 413, which arrives as
+// ErrLimitExceeded.
 func (c *Client) SetRemoteLink(ctx context.Context, key string, input RemoteLinkInput) (int64, error) {
 	if key == "" {
 		return 0, fmt.Errorf("%w: issue key cannot be empty", ErrInvalidArgument)

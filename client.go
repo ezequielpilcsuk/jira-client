@@ -19,9 +19,9 @@ const (
 	headerContentType = "Content-Type"
 	headerAccept      = "Accept"
 
-	// apiBase is the REST v3 prefix. v3 is chosen because it is ADF-native, not because v2 is going
-	// away — Atlassian maintains both and documents them as offering the same operations. Note that
-	// /rest/api/latest resolves to v2 semantics, so it is not a safe alias for this.
+	// apiBase is the REST v3 prefix, chosen because v3 is ADF-native. Atlassian maintains v2 alongside
+	// it with the same operations, and /rest/api/latest resolves to v2 semantics — so it is not a safe
+	// alias for this.
 	apiBase = "/rest/api/3"
 
 	// prioritySearchPageSize is the page size for /priority/search, whose own default is 50.

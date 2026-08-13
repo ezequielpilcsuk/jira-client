@@ -92,7 +92,7 @@ func TestGetIssues_MissingKeysAreSimplyAbsent(t *testing.T) {
 	}
 }
 
-func TestSearchReconciled_ReadAfterWrite(t *testing.T) {
+func TestSearch_ReconcilesTheIssuesNamed(t *testing.T) {
 	t.Run("passes the ids on every page", func(t *testing.T) {
 		var perPageIDs [][]string
 		client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
