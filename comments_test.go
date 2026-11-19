@@ -388,3 +388,53 @@ func TestAddComment_UndecodableBodyIsNotAFailedWrite(t *testing.T) {
 		t.Errorf("no id was recoverable, got %q", comment.ID)
 	}
 }
+
+// End to end: the posted payload carries the mention and the link, not the raw tokens.
+func TestAddComment_PostsExpandedTokens(t *testing.T) {
+	var posted string
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		posted = string(body)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, `{"id":"1"}`)
+	})
+
+	doc, err := client.NewDocBuilder().AddParagraphs("[@acct-1] duplicate of [issue:ABC-10]").Build()
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, err := client.AddComment(context.Background(), "ABC-11", doc); err != nil {
+		t.Fatalf("add comment: %v", err)
+	}
+
+	for _, fragment := range []string{`"type":"mention"`, `"id":"acct-1"`, `"type":"link"`, `/browse/ABC-10`} {
+		if contains(posted, fragment) == false {
+			t.Errorf("payload missing %s\ngot: %s", fragment, posted)
+		}
+	}
+	if contains(posted, "[issue:") || contains(posted, "[@") {
+		t.Errorf("raw tokens leaked into the payload: %s", posted)
+	}
+}
+
+func TestComments_CarryTheAuthorNameAndTheUpdateTime(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"total":1,"comments":[{"id":"1",
+			"author":{"accountId":"acc-1","displayName":"Ada Lovelace"},
+			"created":"2026-08-11T13:00:32.478-0700","updated":"2026-08-12T09:15:00.000-0700",
+			"body":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"hi"}]}]}}]}`)
+	})
+
+	comments, err := client.Comments(context.Background(), "ABC-1", "")
+
+	if err != nil || len(comments) != 1 {
+		t.Fatalf("comments: %v, err %v", comments, err)
+	}
+	comment := comments[0]
+	if comment.AuthorName != "Ada Lovelace" {
+		t.Errorf("author name = %q", comment.AuthorName)
+	}
+	if comment.Updated.IsZero() == true || comment.Updated.After(comment.Created) == false {
+		t.Errorf("updated = %s, created = %s", comment.Updated, comment.Created)
+	}
+}

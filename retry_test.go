@@ -219,3 +219,81 @@ func TestParseRetryAfter_AcceptsAnHTTPDate(t *testing.T) {
 		t.Fatalf("wait = %s, want about 90s", wait)
 	}
 }
+
+func TestRetry_RetriesRateLimitThenSucceeds(t *testing.T) {
+	attempts := 0
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.Header().Set("RateLimit-Reason", "jira-per-issue-on-write")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}, WithRetryPolicy(RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}))
+
+	if err := client.AddLabel(context.Background(), "ABC-1", "x"); err != nil {
+		t.Fatalf("should have recovered: %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestRetry_GivesUpAndDoesNotRetryClientErrors(t *testing.T) {
+	attempts := 0
+	policy := RetryPolicy{MaxAttempts: 3, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond}
+
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusTooManyRequests)
+	}, WithRetryPolicy(policy))
+	if err := client.AddLabel(context.Background(), "ABC-1", "x"); err == nil {
+		t.Fatal("want error after exhausting attempts")
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts = %d, want 3", attempts)
+	}
+
+	attempts = 0
+	badRequest := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusBadRequest)
+	}, WithRetryPolicy(policy))
+	if err := badRequest.AddLabel(context.Background(), "ABC-1", "x"); err == nil {
+		t.Fatal("want error")
+	}
+	if attempts != 1 {
+		t.Fatalf("400 must not be retried, attempts = %d", attempts)
+	}
+}
+
+// Without an explicit policy the client does not retry, so a caller with its own retry wrapper is
+// not silently double-retrying.
+func TestRetry_DisabledByDefault(t *testing.T) {
+	attempts := 0
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusTooManyRequests)
+	})
+
+	_ = client.AddLabel(context.Background(), "ABC-1", "x")
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestDefaultRetryPolicy(t *testing.T) {
+	policy := DefaultRetryPolicy()
+
+	if policy.MaxAttempts <= 1 {
+		t.Errorf("MaxAttempts = %d, which disables retrying", policy.MaxAttempts)
+	}
+	if policy.BaseDelay <= 0 || policy.MaxDelay < policy.BaseDelay {
+		t.Errorf("delays are inconsistent: base %v, max %v", policy.BaseDelay, policy.MaxDelay)
+	}
+	if policy.RetryServerErrors == false {
+		t.Error("the default should retry the 5xx responses Jira returns transiently")
+	}
+}

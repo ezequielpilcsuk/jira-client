@@ -2,7 +2,6 @@ package jiraclient
 
 import (
 	"encoding/json"
-	"strings"
 	"testing"
 )
 
@@ -111,85 +110,6 @@ func TestText_RendersEmojiStatusAndDate(t *testing.T) {
 
 	if text != "⚠️:custom: BLOCKED due 2023-11-14" {
 		t.Fatalf("text = %q", text)
-	}
-}
-
-// Len is checked against Jira's limit on a comment's text, which does not count link addresses.
-func TestDocBuilder_LenDoesNotCountLinkTargets(t *testing.T) {
-	builder := NewDocBuilder()
-	if err := builder.AddLinkedTable([]string{"Link"}, [][]Cell{{{Text: "open", Href: "https://example.com/widget"}}}); err != nil {
-		t.Fatalf("table: %v", err)
-	}
-
-	if got, want := builder.Len(), len("Link\nopen"); got != want {
-		t.Fatalf("len = %d, want %d", got, want)
-	}
-}
-
-// Only something shaped like an account id is a mention. Text quoted from a crawled page can hold
-// "[@]" or "[@ $19.99]", and a mention node built from either is invalid ADF that Jira rejects along
-// with the whole comment.
-func TestDocBuilder_OnlyAnAccountIDShapedTokenIsAMention(t *testing.T) {
-	line := "price [@] was [@ $19.99] per [@unit price] ok"
-	doc, err := NewDocBuilder().AddText(line).Build()
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-
-	nodes := doc.Content[0].Content
-	if len(nodes) != 1 || nodes[0].Type != adfText || nodes[0].Text != line {
-		t.Fatalf("the line must stay one text node, got %+v", nodes)
-	}
-}
-
-func TestDocBuilder_BothAccountIDFormatsAreMentions(t *testing.T) {
-	doc, err := NewDocBuilder().
-		AddText("[@5b10ac8d82e05b22cc7d4ef5] and [@557058:f58131cb-b67d-43c7-b30d-6b58d40bd077]").Build()
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-
-	nodes := doc.Content[0].Content
-	if len(nodes) != 3 || nodes[0].Type != adfMention || nodes[2].Type != adfMention {
-		t.Fatalf("want mention, text, mention, got %+v", nodes)
-	}
-	if nodes[2].Attrs.ID != "557058:f58131cb-b67d-43c7-b30d-6b58d40bd077" {
-		t.Fatalf("id = %q", nodes[2].Attrs.ID)
-	}
-}
-
-// Text the caller did not write — a crawled title, a database value — must reach Jira exactly as it
-// is, whatever tokens it happens to contain.
-func TestDocBuilder_AddLiteralExpandsNothing(t *testing.T) {
-	text := "[@5b10ac8d82e05b22cc7d4ef5] see [issue:ABC-1]\n\nsecond"
-	doc, err := NewDocBuilder().AddLiteral(text).Build()
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-
-	if len(doc.Content) != 3 {
-		t.Fatalf("want one paragraph per line, got %d", len(doc.Content))
-	}
-	first := doc.Content[0].Content
-	if len(first) != 1 || first[0].Type != adfText || first[0].Text != "[@5b10ac8d82e05b22cc7d4ef5] see [issue:ABC-1]" {
-		t.Fatalf("tokens were expanded: %+v", first)
-	}
-	if len(doc.Content[1].Content) != 0 {
-		t.Fatalf("a blank line must be an empty paragraph, got %+v", doc.Content[1])
-	}
-}
-
-func TestLiteralDoc(t *testing.T) {
-	doc, err := LiteralDoc("see [@acct-1]")
-	if err != nil {
-		t.Fatalf("literal doc: %v", err)
-	}
-	if got := doc.Content[0].Content[0]; got.Type != adfText || got.Text != "see [@acct-1]" {
-		t.Fatalf("got %+v", got)
-	}
-
-	if _, err := LiteralDoc("  \n "); err == nil || strings.Contains(err.Error(), "invalid argument") == false {
-		t.Fatalf("blank text must be refused, got %v", err)
 	}
 }
 

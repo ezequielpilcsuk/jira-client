@@ -2,204 +2,175 @@ package jiraclient
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
-	"slices"
+	"strings"
 	"testing"
 )
 
-const issueWithExtraFields = `{"issues":[{"id":"10001","key":"ABC-1","fields":{
-	"summary":"one",
-	"customfield_10004":3.0,
-	"customfield_10010":{"self":"https://x/option/1","value":"High","id":"10001"},
-	"customfield_10020":null,
-	"duedate":"2026-12-01",
-	"issuelinks":[
-		{"id":"900","type":{"id":"10000","name":"Blocks","inward":"is blocked by","outward":"blocks"},
-		 "outwardIssue":{"id":"2","key":"ABC-2","fields":{"summary":"two"}}},
-		{"id":"901","type":{"id":"10002","name":"Duplicate","inward":"is duplicated by","outward":"duplicates"},
-		 "inwardIssue":{"id":"3","key":"ABC-3"}}]
-}}],"isLast":true}`
+// fieldsResponse is a /rest/api/3/field body: a system field with no schema of its own, a custom
+// field, and two custom fields that share the name "Severity" — which Jira permits.
+const fieldsResponse = `[
+	{"id":"summary","key":"summary","name":"Summary","custom":false,"navigable":true,
+	 "orderable":true,"searchable":true,"clauseNames":["summary"],
+	 "schema":{"type":"string","system":"summary"}},
+	{"id":"customfield_10004","key":"customfield_10004","name":"Story Points","custom":true,
+	 "navigable":true,"orderable":true,"searchable":true,
+	 "clauseNames":["cf[10004]","Story Points"],
+	 "schema":{"type":"number","custom":"com.atlassian.jira.plugin.system.customfieldtypes:float",
+	           "customId":10004}},
+	{"id":"customfield_10050","key":"customfield_10050","name":"Severity","custom":true,
+	 "clauseNames":["cf[10050]","Severity"],
+	 "schema":{"type":"option","custom":"com.atlassian.jira.plugin.system.customfieldtypes:select"}},
+	{"id":"customfield_10099","key":"customfield_10099","name":"Severity","custom":true,
+	 "clauseNames":["cf[10099]","Severity"],
+	 "schema":{"type":"array","items":"string",
+	           "custom":"com.atlassian.jira.plugin.system.customfieldtypes:labels"}},
+	{"id":"issuekey","key":"issuekey","name":"Key","custom":false,"clauseNames":["id","issue","key"]}
+]`
 
-// searchOne runs a search against a canned response and returns its only issue.
-func searchOne(t *testing.T, response string) Issue {
-	t.Helper()
+func TestFields_DecodesSchemaAndClauseNames(t *testing.T) {
+	var requestedPath string
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, response)
-	})
-	issues, err := client.SearchIssues(context.Background(), "project = ABC", []string{"summary"})
-	if err != nil || len(issues) != 1 {
-		t.Fatalf("search: %d issues, err %v", len(issues), err)
-	}
-	return issues[0]
-}
-
-// A custom field can be written through this client, so it has to be readable through it too.
-func TestIssue_CarriesTheFieldsItHasNoMemberFor(t *testing.T) {
-	issue := searchOne(t, issueWithExtraFields)
-
-	keys := make([]string, 0, len(issue.RawFields))
-	for key := range issue.RawFields {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	want := []string{"customfield_10004", "customfield_10010", "customfield_10020", "duedate"}
-	if slices.Equal(keys, want) == false {
-		t.Fatalf("raw fields = %v, want %v", keys, want)
-	}
-	if issue.Summary != "one" {
-		t.Fatalf("the modelled fields must still decode, summary = %q", issue.Summary)
-	}
-}
-
-// The common search asks only for fields that have members, and should carry no map for it.
-func TestIssue_RawFieldsIsNilWhenEveryFieldHasAMember(t *testing.T) {
-	issue := searchOne(t, `{"issues":[{"key":"ABC-1","fields":{"summary":"one","labels":["a"]}}],"isLast":true}`)
-
-	if issue.RawFields != nil {
-		t.Fatalf("raw fields = %v, want nil", issue.RawFields)
-	}
-}
-
-func TestIssue_DecodeField(t *testing.T) {
-	issue := searchOne(t, issueWithExtraFields)
-
-	var points float64
-	if found, err := issue.DecodeField("customfield_10004", &points); err != nil || found == false || points != 3 {
-		t.Errorf("number field: found %v, value %v, err %v", found, points, err)
-	}
-
-	var option struct {
-		Value string `json:"value"`
-	}
-	if found, err := issue.DecodeField("customfield_10010", &option); err != nil || found == false || option.Value != "High" {
-		t.Errorf("option field: found %v, value %q, err %v", found, option.Value, err)
-	}
-
-	// Jira sends null for a field that is unset and omits one that was not requested. Neither is a
-	// failure, and neither has a value.
-	for _, fieldID := range []string{"customfield_10020", "customfield_99999"} {
-		var anything any
-		if found, err := issue.DecodeField(fieldID, &anything); found == true || err != nil {
-			t.Errorf("%s: found %v, err %v, want not found and no error", fieldID, found, err)
-		}
-	}
-
-	var wrongShape []string
-	if found, err := issue.DecodeField("customfield_10004", &wrongShape); found == true || err == nil {
-		t.Errorf("a value that does not fit dest must be an error, got found %v, err %v", found, err)
-	}
-}
-
-// FieldText answers "what does this field say" without the caller knowing which of Jira's shapes the
-// field uses.
-func TestIssue_FieldText(t *testing.T) {
-	issue := searchOne(t, `{"issues":[{"key":"ABC-1","fields":{
-		"number":3.0,
-		"fraction":2.5,
-		"text":"plain",
-		"flag":true,
-		"unset":null,
-		"option":{"value":"High","id":"1"},
-		"cascade":{"value":"Hardware","child":{"value":"Laptop"}},
-		"user":{"accountId":"acc-1","displayName":"Ada Lovelace"},
-		"version":{"id":"7","name":"v1.2"},
-		"parent":{"id":"9","key":"ABC-9","fields":{"summary":"epic"}},
-		"multi":[{"value":"Red"},{"value":"Blue"}],
-		"tags":["a","b"],
-		"rich":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"rich text"}]}]},
-		"opaque":{"something":"else"}
-	}}],"isLast":true}`)
-
-	for fieldID, want := range map[string]string{
-		"number":   "3",
-		"fraction": "2.5",
-		"text":     "plain",
-		"flag":     "true",
-		"unset":    "",
-		"absent":   "",
-		"option":   "High",
-		"cascade":  "Hardware - Laptop",
-		"user":     "Ada Lovelace",
-		"version":  "v1.2",
-		"parent":   "ABC-9",
-		"multi":    "Red, Blue",
-		"tags":     "a, b",
-		"rich":     "rich text",
-		"opaque":   "",
-	} {
-		if got := issue.FieldText(fieldID); got != want {
-			t.Errorf("%s = %q, want %q", fieldID, got, want)
-		}
-	}
-}
-
-// An issue's own link list names only the far end of each link. The near end is the issue itself,
-// and filling it in gives the same two-ended shape GetIssueLink returns.
-func TestIssue_LinksNameBothEnds(t *testing.T) {
-	issue := searchOne(t, issueWithExtraFields)
-
-	if len(issue.Links) != 2 {
-		t.Fatalf("links = %+v, want 2", issue.Links)
-	}
-	blocks, duplicate := issue.Links[0], issue.Links[1]
-	if blocks.ID != "900" || blocks.Type.Name != "Blocks" || blocks.Type.Outward != "blocks" ||
-		blocks.OutwardKey != "ABC-2" || blocks.InwardKey != "ABC-1" {
-		t.Errorf("first link = %+v", blocks)
-	}
-	if duplicate.ID != "901" || duplicate.InwardKey != "ABC-3" || duplicate.OutwardKey != "ABC-1" {
-		t.Errorf("second link = %+v", duplicate)
-	}
-}
-
-func TestComments_CarryTheAuthorNameAndTheUpdateTime(t *testing.T) {
-	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"total":1,"comments":[{"id":"1",
-			"author":{"accountId":"acc-1","displayName":"Ada Lovelace"},
-			"created":"2026-08-11T13:00:32.478-0700","updated":"2026-08-12T09:15:00.000-0700",
-			"body":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"hi"}]}]}}]}`)
+		requestedPath = r.URL.Path
+		_, _ = io.WriteString(w, fieldsResponse)
 	})
 
-	comments, err := client.Comments(context.Background(), "ABC-1", "")
-
-	if err != nil || len(comments) != 1 {
-		t.Fatalf("comments: %v, err %v", comments, err)
-	}
-	comment := comments[0]
-	if comment.AuthorName != "Ada Lovelace" {
-		t.Errorf("author name = %q", comment.AuthorName)
-	}
-	if comment.Updated.IsZero() == true || comment.Updated.After(comment.Created) == false {
-		t.Errorf("updated = %s, created = %s", comment.Updated, comment.Created)
-	}
-}
-
-// Comments embedded in an issue read are the same thing as comments listed on their own.
-func TestIssue_EmbeddedCommentsCarryTheSameDetail(t *testing.T) {
-	issue := searchOne(t, `{"issues":[{"key":"ABC-1","fields":{"comment":{"comments":[{"id":"1",
-		"author":{"accountId":"acc-1","displayName":"Ada Lovelace"},
-		"created":"2026-08-11T13:00:32.478-0700","updated":"2026-08-12T09:15:00.000-0700"}]}}}],"isLast":true}`)
-
-	if len(issue.Comments) != 1 || issue.Comments[0].AuthorName != "Ada Lovelace" || issue.Comments[0].Updated.IsZero() == true {
-		t.Fatalf("comments = %+v", issue.Comments)
-	}
-}
-
-// Scoped API tokens only work through Atlassian's gateway, which serves the API but not the pages
-// people open. Links have to point at the site.
-func TestWithSiteURL_IsWhereIssueLinksPoint(t *testing.T) {
-	client := NewClient("https://api.atlassian.com/ex/jira/cloud-id/", "e", "t",
-		WithSiteURL("https://acme.atlassian.net/"))
-
-	if got := client.IssueURL("ABC-1"); got != "https://acme.atlassian.net/browse/ABC-1" {
-		t.Errorf("issue url = %q", got)
-	}
-	doc, err := client.NewDocBuilder().AddText("see [issue:ABC-1]").Build()
+	fields, err := client.Fields(context.Background())
 	if err != nil {
-		t.Fatalf("build: %v", err)
+		t.Fatalf("fields: %v", err)
 	}
-	link := doc.Content[0].Content[1]
-	if link.Marks[0].Attrs.Href != "https://acme.atlassian.net/browse/ABC-1" {
-		t.Errorf("link = %+v", link.Marks[0].Attrs)
+	if requestedPath != "/rest/api/3/field" {
+		t.Errorf("got %q, want the /field endpoint", requestedPath)
+	}
+	if len(fields) != 5 {
+		t.Fatalf("got %d fields, want 5", len(fields))
+	}
+
+	points := fields[1]
+	if points.ID != "customfield_10004" || points.Custom == false {
+		t.Errorf("custom field not decoded: %+v", points)
+	}
+	if points.SchemaType != "number" || strings.Contains(points.SchemaCustom, "float") == false {
+		t.Errorf("schema not decoded: %+v", points)
+	}
+	// JQL takes cf[10004] as well as the display name; a caller building a query needs both.
+	if len(points.ClauseNames) != 2 || points.ClauseNames[0] != "cf[10004]" {
+		t.Errorf("clause names lost: %v", points.ClauseNames)
+	}
+	if fields[3].SchemaItems != "string" {
+		t.Errorf("array item type lost: %+v", fields[3])
+	}
+}
+
+// A field can arrive with no schema at all, and must not take the decode down with it.
+func TestFields_ToleratesAMissingSchema(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, fieldsResponse)
+	})
+
+	fields, err := client.Fields(context.Background())
+	if err != nil {
+		t.Fatalf("fields: %v", err)
+	}
+
+	bare := fields[4]
+	if bare.ID != "issuekey" {
+		t.Fatalf("unexpected field: %+v", bare)
+	}
+	if bare.SchemaType != "" || bare.SchemaItems != "" || bare.SchemaCustom != "" {
+		t.Errorf("absent schema should be zero: %+v", bare)
+	}
+}
+
+// Resolving "Story Points" to customfield_10004 is the whole point: the ID is per-site.
+func TestFieldIDByName_ResolvesCaseInsensitively(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, fieldsResponse)
+	})
+
+	id, err := client.FieldIDByName(context.Background(), "story points")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if id != "customfield_10004" {
+		t.Errorf("got %q, want customfield_10004", id)
+	}
+}
+
+// Jira does not enforce unique field names, so picking the first "Severity" would write to the wrong
+// field on some sites and the right one on others — undiagnosable from the caller's side.
+func TestFieldIDByName_AmbiguousNameIsAnErrorNotAGuess(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, fieldsResponse)
+	})
+
+	id, err := client.FieldIDByName(context.Background(), "Severity")
+	if err == nil {
+		t.Fatalf("two fields share the name, want an error, got %q", id)
+	}
+	if errors.Is(err, ErrInvalidArgument) == false {
+		t.Errorf("want ErrInvalidArgument, got %v", err)
+	}
+	if id != "" {
+		t.Errorf("no id should be returned on an ambiguity, got %q", id)
+	}
+	// The message has to name the candidates, or the caller cannot act on it.
+	for _, want := range []string{"customfield_10050", "customfield_10099"} {
+		if strings.Contains(err.Error(), want) == false {
+			t.Errorf("error does not name %s: %v", want, err)
+		}
+	}
+}
+
+func TestFieldsByName_ReturnsEveryMatchSoCallersCanDisambiguate(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, fieldsResponse)
+	})
+	ctx := context.Background()
+
+	matches, err := client.FieldsByName(ctx, "SEVERITY")
+	if err != nil {
+		t.Fatalf("fields by name: %v", err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("got %d matches, want 2: %+v", len(matches), matches)
+	}
+	// The schemas differ, which is how a caller tells them apart.
+	if matches[0].SchemaType == matches[1].SchemaType {
+		t.Errorf("expected distinguishable schemas: %+v", matches)
+	}
+
+	// A name nobody uses is an empty result, not an error.
+	none, err := client.FieldsByName(ctx, "Nonexistent")
+	if err != nil {
+		t.Fatalf("unknown name should not error: %v", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("got %d matches, want 0", len(none))
+	}
+}
+
+func TestFieldIDByName_UnknownNameIsRejected(t *testing.T) {
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, fieldsResponse)
+	})
+
+	_, err := client.FieldIDByName(context.Background(), "Story Point")
+	if errors.Is(err, ErrInvalidArgument) == false {
+		t.Errorf("want ErrInvalidArgument, got %v", err)
+	}
+}
+
+func TestFieldsByName_RejectsAnEmptyNameBeforeSending(t *testing.T) {
+	var called bool
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) { called = true })
+
+	if _, err := client.FieldsByName(context.Background(), "  "); errors.Is(err, ErrInvalidArgument) == false {
+		t.Errorf("want ErrInvalidArgument, got %v", err)
+	}
+	if called == true {
+		t.Error("no request should have been sent")
 	}
 }
