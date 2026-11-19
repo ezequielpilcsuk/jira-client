@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // SummaryMaxChars is Jira's hard limit on the summary field. Exceeding it rejects the whole edit, so
@@ -83,6 +84,7 @@ func (c *Client) search(ctx context.Context, jql string, fields, reconcileIDs []
 
 	var result SearchResult
 	seenWarning := map[string]bool{}
+	seenToken := map[string]bool{}
 	pageToken := ""
 	for {
 		query := url.Values{}
@@ -119,6 +121,13 @@ func (c *Client) search(ctx context.Context, jql string, fields, reconcileIDs []
 		if page.IsLast == true || page.NextPageToken == "" {
 			break
 		}
+		// A token Jira has already issued leads back to a page already read, and from there round
+		// again without end.
+		if seenToken[page.NextPageToken] == true {
+			return SearchResult{}, fmt.Errorf("%w: search returned a page token it had already issued",
+				ErrPaginationStalled)
+		}
+		seenToken[page.NextPageToken] = true
 		pageToken = page.NextPageToken
 	}
 	return result, nil
@@ -175,7 +184,7 @@ func (c *Client) GetIssues(ctx context.Context, keys []string, fields []string) 
 			"issueIdsOrKeys": keys[start:end],
 			"fields":         fields,
 		}
-		body, err := c.do(ctx, "POST", apiBase+"/issue/bulkfetch", payload)
+		body, err := c.postReplayable(ctx, apiBase+"/issue/bulkfetch", payload)
 		if err != nil {
 			return nil, err
 		}
@@ -214,9 +223,8 @@ func (c *Client) CreateIssue(ctx context.Context, input CreateIssueInput) (strin
 	if input.ProjectKey == "" || input.IssueType == "" || strings.TrimSpace(input.Summary) == "" {
 		return "", fmt.Errorf("%w: project, issue type and summary are required", ErrInvalidArgument)
 	}
-	if len(input.Summary) > SummaryMaxChars {
-		return "", fmt.Errorf("%w: summary is %d chars, over the %d limit",
-			ErrInvalidArgument, len(input.Summary), SummaryMaxChars)
+	if err := validateSummaryLength(input.Summary); err != nil {
+		return "", err
 	}
 	if c.skipMutation("CreateIssue", input.ProjectKey, input.Summary) == true {
 		return DryRunID, nil
@@ -279,14 +287,23 @@ func (c *Client) UpdateSummary(ctx context.Context, key, summary string) error {
 	if key == "" || strings.TrimSpace(summary) == "" {
 		return fmt.Errorf("%w: key and summary are required", ErrInvalidArgument)
 	}
-	if len(summary) > SummaryMaxChars {
-		return fmt.Errorf("%w: summary is %d chars, over the %d limit",
-			ErrInvalidArgument, len(summary), SummaryMaxChars)
+	if err := validateSummaryLength(summary); err != nil {
+		return err
 	}
 	if c.skipMutation("UpdateSummary", key, summary) == true {
 		return nil
 	}
 	return c.updateFields(ctx, key, map[string]any{"summary": summary})
+}
+
+// validateSummaryLength refuses a summary over Jira's limit, which counts characters rather than
+// bytes.
+func validateSummaryLength(summary string) error {
+	if size := utf8.RuneCountInString(summary); size > SummaryMaxChars {
+		return fmt.Errorf("%w: summary is %d chars, over the %d limit",
+			ErrInvalidArgument, size, SummaryMaxChars)
+	}
+	return nil
 }
 
 // UpdateCustomField sets a single custom field, e.g. UpdateCustomField(ctx, key,

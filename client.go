@@ -63,11 +63,15 @@ func WithHTTPClient(httpClient *http.Client) ClientOption {
 	}
 }
 
-// WithTimeout sets the request timeout on the default HTTP client.
+// WithTimeout sets the request timeout. Options apply in the order given, so pass it after
+// WithHTTPClient when using both.
 func WithTimeout(timeout time.Duration) ClientOption {
 	return func(c *Client) {
 		if timeout > 0 {
-			c.httpClient.Timeout = timeout
+			// Set on a copy: the client in place may be one the caller supplied and shares elsewhere.
+			withTimeout := *c.httpClient
+			withTimeout.Timeout = timeout
+			c.httpClient = &withTimeout
 		}
 	}
 }
@@ -150,6 +154,11 @@ type request struct {
 	// with a 303 to a media host, and Go strips Authorization across hosts, so following it in-client
 	// would fail auth — the caller needs the Location instead.
 	NoRedirect bool
+	// Replayable marks a POST that is safe to send twice: a read Jira models as a POST, or a write that
+	// sets a state rather than adding to it. Every other POST creates something each time it runs, so
+	// a 5xx on one is not retried unless the policy opts in. Other methods are replayable by nature
+	// and ignore this.
+	Replayable bool
 }
 
 // do performs a request, retrying rate-limited and transient failures per the retry policy.
@@ -173,21 +182,33 @@ func (c *Client) doRequest(ctx context.Context, req request) ([]byte, http.Heade
 		}
 	}
 
+	replayable := req.Method != http.MethodPost || req.Replayable == true
 	for attempt := 1; ; attempt++ {
 		body, header, err := c.attempt(ctx, req, encoded)
 		if err == nil {
 			return body, header, nil
 		}
 
-		delay, retry := c.shouldRetry(err, attempt)
+		delay, retry := c.shouldRetry(err, attempt, replayable)
 		if retry == false {
+			return nil, nil, err
+		}
+		// A wait the context cannot outlive would end in a deadline error that hides why the call
+		// failed, so the failure itself is returned instead.
+		if deadline, ok := ctx.Deadline(); ok == true && time.Until(deadline) < delay {
 			return nil, nil, err
 		}
 		c.logf("jira %s %s failed (attempt %d), retrying in %s: %v", req.Method, req.Path, attempt, delay, err)
 		if sleepErr := sleep(ctx, delay); sleepErr != nil {
-			return nil, nil, sleepErr
+			return nil, nil, fmt.Errorf("%w while waiting to retry: %w", sleepErr, err)
 		}
 	}
+}
+
+// postReplayable is do for a POST that is safe to send twice. See request.Replayable.
+func (c *Client) postReplayable(ctx context.Context, path string, payload any) ([]byte, error) {
+	body, _, err := c.doRequest(ctx, request{Method: "POST", Path: path, Payload: payload, Replayable: true})
+	return body, err
 }
 
 // attempt performs one request. A non-2xx response becomes an *APIError carrying the status and

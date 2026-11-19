@@ -1,10 +1,14 @@
 package jiraclient
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 // Atlassian Document Format node and mark types used by this package.
@@ -31,7 +35,11 @@ const (
 
 // mentionPattern recognises "[@accountId]" in text passed to the builder, converting it into a real
 // Jira mention node so the user is actually notified. Plain "@name" text notifies nobody.
-var mentionPattern = regexp.MustCompile(`\[@(.*?)\]`)
+//
+// An account id is opaque, but it is only ever letters, digits, colons, hyphens and underscores. The
+// pattern asks for exactly that, so an empty pair of brackets, a price or a phrase that happens to
+// follow "[@" stays ordinary text instead of becoming a mention node Jira would reject.
+var mentionPattern = regexp.MustCompile(`\[@([A-Za-z0-9:_-]+)\]`)
 
 // issuePattern recognises "[issue:KEY]" in text passed to the builder and renders it as a link to
 // that issue. It is deliberately narrow — an uppercase project key followed by a number — so ordinary
@@ -56,7 +64,7 @@ func (d *ADFDoc) Text() string {
 	if d == nil {
 		return ""
 	}
-	return nodesText(d.Content)
+	return nodesText(d.Content, true)
 }
 
 // ADFNode is a single node in an ADF document.
@@ -78,6 +86,67 @@ type ADFAttrs struct {
 	Level                 int    `json:"level,omitempty"`
 	IsNumberColumnEnabled bool   `json:"isNumberColumnEnabled,omitempty"`
 	Width                 int    `json:"width,omitempty"`
+	// URL is the address of a smart link (inlineCard, blockCard, embedCard), which is what pasting a
+	// URL into Jira's editor produces.
+	URL string `json:"url,omitempty"`
+	// Text is the label of a mention ("@Ada Lovelace"), a status lozenge or an emoji.
+	Text string `json:"text,omitempty"`
+	// ShortName is an emoji's name, e.g. ":warning:".
+	ShortName string `json:"shortName,omitempty"`
+	// Timestamp is a date node's value: milliseconds since the Unix epoch, as a string.
+	Timestamp string `json:"timestamp,omitempty"`
+}
+
+// UnmarshalJSON reads the attributes this package uses and skips whatever it cannot read. attrs is an
+// open bag whose value types vary by node — width is an integer on a table and a fractional
+// percentage on an image — so a shape that is not modelled here is dropped rather than allowed to
+// fail the decode of the issue that contains it.
+func (a *ADFAttrs) UnmarshalJSON(data []byte) error {
+	// Anything but an object leaves raw empty, which reads as no attributes at all: a malformed attrs
+	// is not worth failing the decode of a whole issue for.
+	var raw map[string]json.RawMessage
+	_ = json.Unmarshal(data, &raw)
+
+	*a = ADFAttrs{
+		Href:      attrString(raw["href"]),
+		Color:     attrString(raw["color"]),
+		ID:        attrString(raw["id"]),
+		Layout:    attrString(raw["layout"]),
+		Level:     int(attrNumber(raw["level"])),
+		Width:     int(attrNumber(raw["width"])),
+		URL:       attrString(raw["url"]),
+		Text:      attrString(raw["text"]),
+		ShortName: attrString(raw["shortName"]),
+		Timestamp: attrString(raw["timestamp"]),
+	}
+	var numbered bool
+	if json.Unmarshal(raw["isNumberColumnEnabled"], &numbered) == nil {
+		a.IsNumberColumnEnabled = numbered
+	}
+	return nil
+}
+
+// attrString reads an attribute as a string, accepting a number where Jira sends one. Anything else,
+// including an absent attribute, reads as "".
+func attrString(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var number json.Number
+	if json.Unmarshal(raw, &number) == nil {
+		return number.String()
+	}
+	return ""
+}
+
+// attrNumber reads an attribute as a number. Anything else, including an absent attribute, reads as 0.
+func attrNumber(raw json.RawMessage) float64 {
+	var number float64
+	if json.Unmarshal(raw, &number) != nil {
+		return 0
+	}
+	return number
 }
 
 // ADFMark is inline formatting applied to a text node (strong, em, link, code...).
@@ -146,11 +215,29 @@ func (b *DocBuilder) AddText(text string) *DocBuilder {
 }
 
 // AddParagraphs appends one paragraph per line, preserving blank lines as empty paragraphs.
+// "[@accountId]" and "[issue:KEY]" are expanded; see AddLiteral for text that must not be.
 func (b *DocBuilder) AddParagraphs(text string) *DocBuilder {
+	return b.addLines(text, true)
+}
+
+// AddLiteral appends one paragraph per line exactly as written, expanding no tokens. Use it for text
+// the caller did not author — a crawled title, a database value, a quoted error — where a stray
+// "[@…]" or "[issue:…]" must stay text rather than become a mention or a link.
+func (b *DocBuilder) AddLiteral(text string) *DocBuilder {
+	return b.addLines(text, false)
+}
+
+// addLines appends one paragraph per line, with or without token expansion. A blank line becomes an
+// empty paragraph, since a text node with no text is invalid.
+func (b *DocBuilder) addLines(text string, expandTokens bool) *DocBuilder {
 	for _, line := range strings.Split(text, "\n") {
 		paragraph := ADFNode{Type: adfParagraph}
-		if line != "" {
+		switch {
+		case line == "":
+		case expandTokens == true:
 			paragraph.Content = b.inlineNodes(line)
+		default:
+			paragraph.Content = []ADFNode{{Type: adfText, Text: line}}
 		}
 		b.nodes = append(b.nodes, paragraph)
 	}
@@ -211,8 +298,10 @@ func (b *DocBuilder) AddLinkedTable(headers []string, rows [][]Cell) error {
 // Nodes exposes the assembled nodes.
 func (b *DocBuilder) Nodes() []ADFNode { return b.nodes }
 
-// Len reports the rendered text length, for checking against CommentMaxChars before posting.
-func (b *DocBuilder) Len() int { return len(nodesText(b.nodes)) }
+// Len reports the rendered text length in characters, for checking against CommentMaxChars before
+// posting. Link addresses are left out, as Jira's limit counts the text a reader sees and not where
+// it points.
+func (b *DocBuilder) Len() int { return utf8.RuneCountInString(nodesText(b.nodes, false)) }
 
 // Build returns the finished document, or an error when nothing was added — Jira rejects an empty
 // document, and an accidentally-empty comment is almost always a bug in the caller.
@@ -229,6 +318,15 @@ func TextDoc(text string) (*ADFDoc, error) {
 		return nil, fmt.Errorf("%w: comment text cannot be empty", ErrInvalidArgument)
 	}
 	return NewDocBuilder().AddParagraphs(text).Build()
+}
+
+// LiteralDoc is TextDoc without token expansion: the text is posted exactly as written. See
+// DocBuilder.AddLiteral for when that matters.
+func LiteralDoc(text string) (*ADFDoc, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, fmt.Errorf("%w: comment text cannot be empty", ErrInvalidArgument)
+	}
+	return NewDocBuilder().AddLiteral(text).Build()
 }
 
 // cellNode builds a table cell. An empty text node is invalid ADF and 400s the whole request, so an
@@ -280,49 +378,147 @@ func (b *DocBuilder) inlineNodes(line string) []ADFNode {
 	return nodes
 }
 
-// nodesText recursively renders nodes to plain text.
-func nodesText(nodes []ADFNode) string {
+// nodesText recursively renders nodes to plain text. linkTargets appends the address of a link whose
+// visible text does not show it; it is off when a document is being measured against Jira's text
+// limit, which does not count addresses.
+func nodesText(nodes []ADFNode, linkTargets bool) string {
 	var builder strings.Builder
 	for i, node := range nodes {
+		last := i == len(nodes)-1
 		switch node.Type {
 		case adfText:
 			builder.WriteString(node.Text)
+			if linkTargets == true {
+				if target := hiddenLinkTarget(node); target != "" {
+					builder.WriteString(" (" + target + ")")
+				}
+			}
 		case "hardBreak":
 			builder.WriteString("\n")
 		case adfMention:
-			if node.Attrs != nil && node.Attrs.ID != "" {
-				builder.WriteString("@" + node.Attrs.ID)
-			}
+			builder.WriteString(mentionText(node.Attrs))
 		case "inlineCard":
-			if node.Attrs != nil && node.Attrs.Href != "" {
-				builder.WriteString(node.Attrs.Href)
+			builder.WriteString(cardURL(node.Attrs))
+		case "blockCard", "embedCard":
+			builder.WriteString(cardURL(node.Attrs))
+			if last == false {
+				builder.WriteString("\n")
 			}
+		case "emoji":
+			if node.Attrs != nil {
+				if node.Attrs.Text != "" {
+					builder.WriteString(node.Attrs.Text)
+				} else {
+					builder.WriteString(node.Attrs.ShortName)
+				}
+			}
+		case "status":
+			if node.Attrs != nil {
+				builder.WriteString(node.Attrs.Text)
+			}
+		case "date":
+			builder.WriteString(dateText(node.Attrs))
 		case adfParagraph, adfHeading:
-			builder.WriteString(nodesText(node.Content))
-			if i < len(nodes)-1 {
+			builder.WriteString(nodesText(node.Content, linkTargets))
+			if last == false {
+				builder.WriteString("\n")
+			}
+		case adfTable:
+			builder.WriteString(tableText(node, linkTargets))
+			if last == false {
 				builder.WriteString("\n")
 			}
 		case "mediaSingle", "media":
 			// Media carries no text.
 		case "codeBlock":
-			builder.WriteString("```\n" + nodesText(node.Content) + "\n```\n")
+			builder.WriteString("```\n" + nodesText(node.Content, linkTargets) + "\n```\n")
 		case "blockquote":
-			builder.WriteString("> " + nodesText(node.Content) + "\n")
+			builder.WriteString("> " + nodesText(node.Content, linkTargets) + "\n")
 		case "bulletList", "orderedList":
 			for _, item := range node.Content {
 				if item.Type == "listItem" {
-					builder.WriteString("• " + nodesText(item.Content) + "\n")
+					builder.WriteString("• " + nodesText(item.Content, linkTargets) + "\n")
 				}
 			}
 		default:
 			if len(node.Content) > 0 {
-				builder.WriteString(nodesText(node.Content))
+				builder.WriteString(nodesText(node.Content, linkTargets))
 			} else if node.Text != "" {
 				builder.WriteString(node.Text)
 			}
 		}
 	}
 	return builder.String()
+}
+
+// tableText renders a table one row per line with " | " between cells, so two neighbouring values
+// stay two values. A cell's own line breaks become spaces to keep the row on its line.
+func tableText(table ADFNode, linkTargets bool) string {
+	rows := make([]string, 0, len(table.Content))
+	for _, row := range table.Content {
+		cells := make([]string, 0, len(row.Content))
+		for _, cell := range row.Content {
+			text := strings.TrimSpace(nodesText(cell.Content, linkTargets))
+			cells = append(cells, strings.ReplaceAll(text, "\n", " "))
+		}
+		rows = append(rows, strings.Join(cells, " | "))
+	}
+	return strings.Join(rows, "\n")
+}
+
+// hiddenLinkTarget returns the address a linked text node points at when reading the text alone would
+// lose it. It is empty when the text already shows the address, or names the issue the address opens.
+func hiddenLinkTarget(node ADFNode) string {
+	for _, mark := range node.Marks {
+		if mark.Type != adfLink || mark.Attrs == nil || mark.Attrs.Href == "" {
+			continue
+		}
+		href := mark.Attrs.Href
+		if strings.Contains(node.Text, href) == true || strings.HasSuffix(href, "/browse/"+node.Text) == true {
+			return ""
+		}
+		return href
+	}
+	return ""
+}
+
+// mentionText renders a mention as the name Jira stored for it, falling back to the account id for
+// a mention written without one.
+func mentionText(attrs *ADFAttrs) string {
+	switch {
+	case attrs == nil:
+		return ""
+	case attrs.Text != "":
+		return attrs.Text
+	case attrs.ID != "":
+		return "@" + attrs.ID
+	}
+	return ""
+}
+
+// cardURL is a smart link's address. It lives in attrs.url; href is read as a fallback for a card
+// built with this package's link attribute.
+func cardURL(attrs *ADFAttrs) string {
+	switch {
+	case attrs == nil:
+		return ""
+	case attrs.URL != "":
+		return attrs.URL
+	}
+	return attrs.Href
+}
+
+// dateText renders a date node as a calendar date. Its timestamp is milliseconds since the epoch;
+// one that does not parse is shown as it came.
+func dateText(attrs *ADFAttrs) string {
+	if attrs == nil || attrs.Timestamp == "" {
+		return ""
+	}
+	millis, err := strconv.ParseInt(attrs.Timestamp, 10, 64)
+	if err != nil {
+		return attrs.Timestamp
+	}
+	return time.UnixMilli(millis).UTC().Format("2006-01-02")
 }
 
 // errEmptyDoc guards callers that build a document without checking Build's error.

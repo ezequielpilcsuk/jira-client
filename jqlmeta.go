@@ -27,7 +27,7 @@ func (c *Client) ApproximateCount(ctx context.Context, jql string) (int, error) 
 		return 0, fmt.Errorf("%w: jql cannot be empty", ErrInvalidArgument)
 	}
 
-	body, err := c.do(ctx, "POST", apiBase+"/search/approximate-count",
+	body, err := c.postReplayable(ctx, apiBase+"/search/approximate-count",
 		map[string]any{"jql": jql})
 	if err != nil {
 		return 0, err
@@ -74,7 +74,7 @@ func (c *Client) ValidateJQL(ctx context.Context, jql ...string) ([]JQLResult, e
 	params := url.Values{}
 	params.Set("validation", jqlValidationStrict)
 
-	body, err := c.do(ctx, "POST", buildPath("/jql/parse", params),
+	body, err := c.postReplayable(ctx, buildPath("/jql/parse", params),
 		map[string]any{"queries": jql})
 	if err != nil {
 		return nil, err
