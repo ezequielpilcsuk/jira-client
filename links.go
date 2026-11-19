@@ -8,6 +8,68 @@ import (
 	"strings"
 )
 
+// Link type names present in a default Jira installation. A site may define others; pass any name.
+const (
+	LinkDuplicate = "Duplicate"
+	LinkRelates   = "Relates"
+	LinkBlocks    = "Blocks"
+	LinkClones    = "Cloners"
+)
+
+// LinkIssues links two issues. The link reads "<outwardKey> <type's outward description> <inwardKey>"
+// — for LinkDuplicate pass the duplicate as outwardKey and the surviving issue as inwardKey, so the
+// duplicate reads "duplicates ORIGIN" and the origin reads "is duplicated by DUPLICATE".
+func (c *Client) LinkIssues(ctx context.Context, linkType, inwardKey, outwardKey string) error {
+	return c.CreateLink(ctx, LinkInput{TypeName: linkType, InwardKey: inwardKey, OutwardKey: outwardKey})
+}
+
+// LinkInput describes an issue link. Give it either a TypeName or a TypeID — sites rename link types,
+// so an ID is the stable reference and a name is the readable one.
+type LinkInput struct {
+	TypeName string
+	TypeID   string
+	// InwardKey and OutwardKey read as "<outward> <type outward> <inward>".
+	InwardKey  string
+	OutwardKey string
+	// Comment, when set, is posted on the link in the same request.
+	Comment *ADFDoc
+}
+
+// CreateLink links two issues, optionally by type ID and optionally with a comment.
+func (c *Client) CreateLink(ctx context.Context, input LinkInput) error {
+	if input.TypeName == "" && input.TypeID == "" {
+		return fmt.Errorf("%w: a link type name or id is required", ErrInvalidArgument)
+	}
+	if input.InwardKey == "" || input.OutwardKey == "" {
+		return fmt.Errorf("%w: both issue keys are required", ErrInvalidArgument)
+	}
+	if input.InwardKey == input.OutwardKey {
+		return fmt.Errorf("%w: cannot link %s to itself", ErrInvalidArgument, input.InwardKey)
+	}
+	if c.skipMutation("CreateLink", input.TypeName+input.TypeID, input.InwardKey, input.OutwardKey) == true {
+		return nil
+	}
+
+	linkType := map[string]string{}
+	if input.TypeID != "" {
+		linkType["id"] = input.TypeID
+	} else {
+		linkType["name"] = input.TypeName
+	}
+
+	payload := map[string]any{
+		"type":         linkType,
+		"inwardIssue":  map[string]string{"key": input.InwardKey},
+		"outwardIssue": map[string]string{"key": input.OutwardKey},
+	}
+	if input.Comment != nil {
+		payload["comment"] = map[string]any{"body": input.Comment}
+	}
+
+	_, err := c.do(ctx, "POST", apiBase+"/issueLink", payload)
+	return err
+}
+
 // A Jira site defines its own issue link types and can rename the built-in ones, so the LinkDuplicate
 // / LinkRelates / LinkBlocks / LinkClones constants are a guess about a site rather than a fact about
 // it — a CreateLink using one fails on any site that renamed "Relates" to "Related to". LinkTypes

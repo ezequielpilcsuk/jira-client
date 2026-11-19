@@ -293,3 +293,29 @@ func TestMyPermissions_ProjectAndIssueScopesCanDisagree(t *testing.T) {
 		t.Error("the issue scope is the authoritative one and must be reported as-is")
 	}
 }
+
+func TestJQLQuote(t *testing.T) {
+	for value, want := range map[string]string{
+		`plain`:             `"plain"`,
+		``:                  `""`,
+		`say "hi"`:          `"say \"hi\""`,
+		`C:\temp`:           `"C:\\temp"`,
+		"two\nlines\tand\r": `"two\nlines\tand\r"`,
+		"bell\x07":          `"bell\u0007"`,
+		`préço €`:           `"préço €"`,
+		`" OR project = X`:  `"\" OR project = X"`,
+	} {
+		if got := JQLQuote(value); got != want {
+			t.Errorf("JQLQuote(%q) = %s, want %s", value, got, want)
+		}
+	}
+}
+
+func TestJQLList(t *testing.T) {
+	if got, want := JQLList("triaged", `b"c`), `("triaged", "b\"c")`; got != want {
+		t.Errorf("JQLList = %s, want %s", got, want)
+	}
+	if got := JQLList(); got != "()" {
+		t.Errorf("empty list = %s, want ()", got)
+	}
+}

@@ -163,6 +163,15 @@ func (c *Client) AddComment(ctx context.Context, key string, doc *ADFDoc) (Comme
 	return c.addComment(ctx, key, doc, nil)
 }
 
+// AddTextComment posts a plain-text comment. "[@accountId]" becomes a real mention.
+func (c *Client) AddTextComment(ctx context.Context, key, text string) (Comment, error) {
+	doc, err := TextDoc(text)
+	if err != nil {
+		return Comment{}, err
+	}
+	return c.AddComment(ctx, key, doc)
+}
+
 // AddRestrictedComment posts a comment only members of a group or project role can read. Everyone
 // else sees the issue without it.
 //

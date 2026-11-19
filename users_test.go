@@ -96,3 +96,62 @@ func TestAccountIDByEmail(t *testing.T) {
 		}
 	})
 }
+
+func TestAccountIDByEmail_PrefersAnExactEmailMatch(t *testing.T) {
+	// Jira matches the query as a prefix, so the wrong account can come back first.
+	t.Run("an exact match wins over an earlier prefix match", func(t *testing.T) {
+		client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, `[
+				{"accountId":"wrong","emailAddress":"ada@example.com.au"},
+				{"accountId":"right","emailAddress":"ada@example.com"}
+			]`)
+		})
+
+		id, err := client.AccountIDByEmail(context.Background(), "ada@example.com")
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if id != "right" {
+			t.Errorf("got %q, want the exactly-matching account", id)
+		}
+	})
+
+	t.Run("matching is case-insensitive", func(t *testing.T) {
+		client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, `[{"accountId":"acct-1","emailAddress":"Ada@Example.COM"}]`)
+		})
+
+		id, err := client.AccountIDByEmail(context.Background(), "ada@example.com")
+		if err != nil || id != "acct-1" {
+			t.Errorf("got (%q, %v), want acct-1", id, err)
+		}
+	})
+
+	// Emails are visible but none matches exactly — every candidate is a longer address.
+	t.Run("a visible but non-matching email resolves to nothing", func(t *testing.T) {
+		client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, `[{"accountId":"wrong","emailAddress":"ada@example.com.au"}]`)
+		})
+
+		id, err := client.AccountIDByEmail(context.Background(), "ada@example.com")
+		if err != nil {
+			t.Fatalf("resolve: %v", err)
+		}
+		if id != "" {
+			t.Errorf("got %q, want no match rather than a wrong one", id)
+		}
+	})
+
+	// Under restrictive profile visibility there is nothing to verify against, so the top match is
+	// the best available guess.
+	t.Run("falls back when every email is hidden", func(t *testing.T) {
+		client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, `[{"accountId":"acct-1","displayName":"Ada"}]`)
+		})
+
+		id, err := client.AccountIDByEmail(context.Background(), "ada@example.com")
+		if err != nil || id != "acct-1" {
+			t.Errorf("got (%q, %v), want acct-1", id, err)
+		}
+	})
+}
