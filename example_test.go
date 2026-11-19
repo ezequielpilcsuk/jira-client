@@ -157,3 +157,77 @@ func ExampleIssue_IsDone() {
 		fmt.Println("finished")
 	}
 }
+
+// A custom field is requested by ID and read back from RawFields.
+func ExampleIssue_FieldText() {
+	client := jiraclient.NewClient("https://your-site.atlassian.net", "bot@example.com", "token")
+	ctx := context.Background()
+
+	// The ID differs per site, so it is resolved by name rather than hardcoded.
+	storyPoints, err := client.FieldIDByName(ctx, "Story Points")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	issue, err := client.GetIssue(ctx, "ABC-123", []string{"summary", storyPoints})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// As text, whatever shape Jira used for the value.
+	fmt.Println(issue.FieldText(storyPoints))
+
+	// Or the exact value. found is false when the field is unset.
+	var points float64
+	if found, err := issue.DecodeField(storyPoints, &points); err == nil && found == true {
+		fmt.Println(points)
+	}
+}
+
+// Several edits to one issue go in one request: Jira limits writes per issue, and one request is
+// applied whole or not at all.
+func ExampleClient_UpdateIssue() {
+	client := jiraclient.NewClient("https://your-site.atlassian.net", "bot@example.com", "token")
+
+	quiet := false
+	err := client.UpdateIssue(context.Background(), "ABC-123", jiraclient.IssueUpdate{
+		Summary:      "Crawler returns no results",
+		Fields:       map[string]any{"customfield_10004": 3},
+		AddLabels:    []string{"triaged"},
+		RemoveLabels: []string{"needs-triage"},
+		NotifyUsers:  &quiet,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// A workflow that demands a resolution on the way to done takes it with the transition.
+func ExampleClient_ApplyTransition() {
+	client := jiraclient.NewClient("https://your-site.atlassian.net", "bot@example.com", "token")
+
+	reason, err := jiraclient.TextDoc("Closing as a duplicate of [issue:ABC-10].")
+	if err != nil {
+		log.Fatal(err)
+	}
+	err = client.ApplyTransition(context.Background(), "ABC-123", jiraclient.TransitionInput{
+		Name:    "Won't Do",
+		Comment: reason,
+		Fields:  map[string]any{"resolution": map[string]string{"name": "Duplicate"}},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+// A value that is not a constant in the source is quoted, so a quote inside it cannot end the string
+// early and rewrite the query.
+func ExampleJQLQuote() {
+	title := `Widget 12" "Pro"`
+
+	fmt.Println("project = ABC AND summary ~ " + jiraclient.JQLQuote(title))
+	fmt.Println("labels IN " + jiraclient.JQLList("triaged", "bot"))
+	// Output:
+	// project = ABC AND summary ~ "Widget 12\" \"Pro\""
+	// labels IN ("triaged", "bot")
+}

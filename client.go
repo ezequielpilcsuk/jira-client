@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,7 +42,9 @@ type Logger interface {
 
 // Client talks to one Jira site.
 type Client struct {
-	baseURL    string
+	baseURL string
+	// siteURL is where people open the site, when that is not baseURL. See WithSiteURL.
+	siteURL    string
 	email      string
 	apiToken   string
 	httpClient *http.Client
@@ -49,6 +52,8 @@ type Client struct {
 	pageSize   int
 	logger     Logger
 	retry      RetryPolicy
+	// deprecations remembers which deprecation notices have been logged, so each is reported once.
+	deprecations sync.Map
 }
 
 // ClientOption configures a Client.
@@ -89,6 +94,16 @@ func WithPageSize(size int) ClientOption {
 			c.pageSize = size
 		}
 	}
+}
+
+// WithSiteURL sets the address people open the site at, e.g. "https://your-site.atlassian.net", which
+// IssueURL and "[issue:KEY]" links are built on.
+//
+// It is needed only when baseURL is not that address. That is the case for scoped API tokens, which
+// work solely through Atlassian's gateway ("https://api.atlassian.com/ex/jira/{cloudId}"): the
+// gateway serves the API and not the pages, so a link built on it opens nothing.
+func WithSiteURL(siteURL string) ClientOption {
+	return func(c *Client) { c.siteURL = strings.TrimRight(siteURL, "/") }
 }
 
 // WithLogger attaches a logger. Without one the client is silent, including in dry-run mode.
@@ -254,6 +269,7 @@ func (c *Client) attempt(ctx context.Context, spec request, payload []byte) ([]b
 		return nil, nil, fmt.Errorf("%s %s: %w", spec.Method, spec.Path, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	c.noteDeprecation(spec, resp.Header)
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -271,6 +287,29 @@ func (c *Client) attempt(ctx context.Context, spec request, payload []byte) ([]b
 		return nil, resp.Header, apiErr
 	}
 	return responseBody, resp.Header, nil
+}
+
+// noteDeprecation logs, once per notice, that Jira has marked the endpoint just called for removal.
+//
+// Atlassian sets Deprecation and Sunset headers on a deprecated endpoint and gives at least six
+// months' notice before removing one, so this line in a service's own log is the earliest warning it
+// gets that a call it depends on is going away. Without a logger there is nowhere to say it.
+func (c *Client) noteDeprecation(spec request, header http.Header) {
+	deprecation, sunset := header.Get("Deprecation"), header.Get("Sunset")
+	if c.logger == nil || (deprecation == "" && sunset == "") {
+		return
+	}
+	link := header.Get("Link")
+
+	// Keyed on the notice rather than the path: a path carries the issue key, and a bulk run through
+	// a deprecated endpoint would otherwise log once per issue.
+	notice := spec.Method + "|" + deprecation + "|" + sunset + "|" + link
+	if _, logged := c.deprecations.LoadOrStore(notice, true); logged == true {
+		return
+	}
+	path, _, _ := strings.Cut(spec.Path, "?")
+	c.logf("jira: %s %s is deprecated and scheduled for removal (Deprecation: %q, Sunset: %q, Link: %q)",
+		spec.Method, path, deprecation, sunset, link)
 }
 
 // buildPath joins the API base with a path and query values.

@@ -1,7 +1,14 @@
 # jira-client
 
-A Go client for the Jira Cloud REST v3 API, built for automations that read and mutate issues in
-bulk.
+[![Go Reference](https://pkg.go.dev/badge/github.com/ezequielpilcsuk/jira-client.svg)](https://pkg.go.dev/github.com/ezequielpilcsuk/jira-client)
+[![Licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+
+A Go client for the **Jira Cloud REST API v3**, built for automations that read and mutate issues in
+bulk. Standard library only — no dependencies.
+
+**Contents:** [Why](#why) · [Installation](#installation) · [Usage](#usage) ·
+[What it covers](#what-it-covers) · [Staying ahead of Jira API changes](#staying-ahead-of-jira-api-changes) ·
+[Authentication](#authentication) · [Stability and versioning](#stability-and-versioning)
 
 ## Why
 
@@ -14,14 +21,18 @@ them once:
 - **Reads are nil-safe.** Jira omits unset fields rather than sending nulls, so code that
   dereferences `description`, `assignee` or `reporter` unconditionally panics on real issues. Every
   field is flattened to a zero value at decode time.
-- **Rate limiting is handled.** Jira limits on several axes, including a per-issue write limit — any
-  workflow that links, comments, labels and transitions the *same* issue can trip it at modest
-  volume. The client retries with exponential backoff and jitter, honouring `Retry-After`.
+- **Retries cannot file a ticket twice.** Jira limits on several axes, including a per-issue write
+  limit that a workflow linking, commenting, labelling and transitioning the *same* issue trips at
+  modest volume. With a retry policy the client backs off and retries — rate limits always, server
+  errors only for requests that are safe to send twice. See [Retries and rate limits](#retries-and-rate-limits).
 - **ADF has sharp edges.** A text node with empty text is invalid and rejects the entire request with
   a 400, which is trivially easy to produce from a table cell that happens to be blank. The document
   builder emits a valid empty paragraph instead.
-- **A transition can carry its comment.** `TransitionWithComment` sends both in one request, so a
-  rejected transition cannot leave an orphaned comment explaining a move that never happened.
+- **Descriptions read back as usable text.** Smart links keep their URL, table cells stay separate
+  values, and mentions carry the person's name — so a description written by one service can be
+  parsed by another.
+- **A transition can carry its comment and its fields.** `ApplyTransition` sends them in one request,
+  so a rejected transition cannot leave an orphaned comment explaining a move that never happened.
 - **Transitions can be resolved by name.** Transition IDs differ between sites and are not status
   IDs; `TransitionByName` looks up what is actually available on the issue.
 - **Comments expand inline tokens.** `[@accountId]` becomes a mention and `[issue:KEY]` a link to
@@ -31,7 +42,7 @@ them once:
   and `PriorityRanks` return the site's real ordering.
 - **Search-after-write is not silently wrong.** Jira's search index is eventually consistent, so an
   issue created a moment ago can be missing from a JQL result. `GetIssues` reads issues directly and
-  `SearchReconciled` reconciles the ids you name, rather than leaving it to chance.
+  `SearchQuery.ReconcileIssues` reconciles the ids you name, rather than leaving it to chance.
 - **Site-specific IDs are discoverable.** Custom field IDs, link type IDs, priorities and account ids
   differ per site, and hardcoding them is what makes an integration break on the next Jira. Every one
   can be resolved by name.
@@ -41,6 +52,8 @@ them once:
 ```bash
 go get github.com/ezequielpilcsuk/jira-client
 ```
+
+The package name is `jiraclient`. It builds on Go 1.22 and later.
 
 ## Usage
 
@@ -52,6 +65,7 @@ client := jiraclient.NewClient(
     "bot@example.com",
     apiToken,
     jiraclient.WithRetryPolicy(jiraclient.DefaultRetryPolicy()),
+    jiraclient.WithLogger(log.New(os.Stderr, "jira ", log.LstdFlags)),
     jiraclient.WithDryRun(cfg.DryRun),
 )
 
@@ -72,8 +86,40 @@ one, err := client.GetIssue(ctx, "ABC-123", nil)
 byKey, err := client.GetIssues(ctx, []string{"ABC-1", "ABC-2"}, nil)
 ```
 
-`Search` follows pagination to the end, so a broad JQL returns everything — narrow the query rather
-than relying on a limit.
+`Search` follows pagination to the end, so a broad JQL returns everything. Set a `Limit` when only
+the first few are wanted:
+
+```go
+newest, err := client.Search(ctx, jiraclient.SearchQuery{
+    JQL:   `project = ABC ORDER BY created DESC`,
+    Limit: 5,
+})
+```
+
+#### Custom fields and links
+
+A field with no member on `Issue` — a custom field above all — is returned in `Issue.RawFields`
+whenever it is requested by ID:
+
+```go
+storyPoints, err := client.FieldIDByName(ctx, "Story Points")   // "customfield_10004" on this site
+
+issue, err := client.GetIssue(ctx, "ABC-123", []string{"summary", "issuelinks", storyPoints})
+
+fmt.Println(issue.FieldText(storyPoints))            // "3" — whatever shape Jira used
+
+var points float64
+found, err := issue.DecodeField(storyPoints, &points) // the exact value; found is false when unset
+
+for _, link := range issue.Links {                    // needs "issuelinks" among the fields
+    fmt.Println(link.ID, link.Type.Name, link.InwardKey, link.OutwardKey)
+}
+```
+
+`FieldText` renders the shapes Jira uses for field values — text, numbers, select options, users,
+versions, rich text, lists of any of them — so a caller does not need to know which one a field is.
+
+#### People
 
 ```go
 // Resolve a person to an account id. "" and no error means nothing matched.
@@ -92,12 +138,36 @@ account.
 err := client.SetAssignee(ctx, "ABC-123", accountID)   // "" unassigns
 err = client.AddLabel(ctx, "ABC-123", "triaged")
 err = client.UpdateSummary(ctx, "ABC-123", "New title")
-err = client.AddTextComment(ctx, "ABC-123", "Handled automatically.")
+comment, err := client.AddTextComment(ctx, "ABC-123", "Handled automatically.")
 
 // Reads "ABC-124 duplicates ABC-123" / "ABC-123 is duplicated by ABC-124".
 err = client.LinkIssues(ctx, jiraclient.LinkDuplicate, "ABC-123", "ABC-124")
 
 err = client.TransitionByName(ctx, "ABC-124", "Won't Do")
+```
+
+Several edits to one issue belong in one request. Jira limits writes per issue, and one request is
+applied whole or not at all:
+
+```go
+quiet := false
+err := client.UpdateIssue(ctx, "ABC-123", jiraclient.IssueUpdate{
+    Summary:      "New title",
+    Fields:       map[string]any{storyPoints: 3},
+    AddLabels:    []string{"triaged"},
+    RemoveLabels: []string{"needs-triage"},
+    NotifyUsers:  &quiet,   // no email to watchers; needs an admin permission
+})
+```
+
+A workflow that demands a resolution on the way to done takes it with the transition:
+
+```go
+err := client.ApplyTransition(ctx, "ABC-124", jiraclient.TransitionInput{
+    Name:    "Won't Do",
+    Comment: doc,
+    Fields:  map[string]any{"resolution": map[string]string{"name": "Won't Do"}},
+})
 ```
 
 ### Rich comments
@@ -124,6 +194,13 @@ comment, err := client.AddComment(ctx, "ABC-123", doc)   // the ID is the only h
 
 `[@accountId]` becomes a real mention node, which actually notifies the user — plain `@name` text
 does not.
+
+Text the automation did not write — a crawled title, a database value, a quoted error — goes through
+`AddLiteral` (or `LiteralDoc`), which expands nothing. A stray `[@…]` in it stays text:
+
+```go
+builder.AddText("Cause reported by the crawler:").AddLiteral(crawlerMessage)
+```
 
 ### Dry run
 
@@ -164,9 +241,17 @@ Prefer `Issue.StatusCategory` (`new` / `indeterminate` / `done`) over `Issue.Sta
 finished" — status *names* are per-workflow and site-editable, so a check against `"Done"` breaks on
 any project that renamed it. `Issue.IsDone()` wraps it.
 
-### Planning a query without running it
+### Building and checking a query
 
-`/search/jql` dropped the `validateQuery` parameter, so validating JQL and counting matches are now
+A value pasted between quotes breaks the query as soon as it contains a quote of its own, and when it
+came from outside — a ticket title, a product name — it can rewrite the query. Quote it:
+
+```go
+jql := "project = ABC AND summary ~ " + jiraclient.JQLQuote(title) +
+    " AND labels IN " + jiraclient.JQLList("triaged", "bot")
+```
+
+`/search/jql` dropped the `validateQuery` parameter, so validating JQL and counting matches are
 separate calls. Both suit a dry run, which is meant to produce a reviewable plan without writing:
 
 ```go
@@ -196,38 +281,6 @@ err = client.GetIssueProperty(ctx, "ABC-123", "my-bot:processed", &state)
 `SetRemoteLink` is idempotent the same way: posting with a `globalId` that already exists updates
 that link rather than adding a second one — though it is a *replace*, so fields you omit are nulled.
 
-### Errors
-
-```go
-switch {
-case errors.Is(err, jiraclient.ErrNotFound):
-case errors.Is(err, jiraclient.ErrUnauthorized):
-case errors.Is(err, jiraclient.ErrRateLimited):     // 429, transient — back off
-case errors.Is(err, jiraclient.ErrLimitExceeded):   // 413, permanent — retrying will not help
-case errors.Is(err, jiraclient.ErrInvalidArgument): // rejected before any request was sent
-}
-
-var apiErr *jiraclient.APIError
-if errors.As(err, &apiErr) {
-    // apiErr.Messages carries Jira's own explanation — a 400 on a bad ADF document
-    // names the node it rejected.
-    log.Printf("status %d: %v (%s)", apiErr.StatusCode, apiErr.Messages, apiErr.RateLimitReason)
-}
-```
-
-## Notes
-
-- Authentication is Jira Cloud basic auth: account email plus an API token. Note that API tokens now
-  **expire** — a year by default — so a 401 on a call that used to work usually means the token needs
-  reissuing rather than that permissions changed.
-- REST **v3** throughout, because it is ADF-native. v2 is *not* deprecated — Atlassian maintains both
-  and documents them as offering the same operations. `/rest/api/latest` resolves to v2 semantics, so
-  it is not a safe alias for v3.
-- Arguments that cannot possibly succeed — an over-long summary, a label containing whitespace, an
-  empty document, a self-link, more than 50 reconcile ids — are rejected locally as
-  `ErrInvalidArgument` rather than sent.
-- The client is stateless and safe for concurrent use.
-
 ### Attachments and worklogs
 
 ```go
@@ -254,23 +307,129 @@ different guarantees are available, and picking the wrong one is the classic sou
 | Call | Consistency |
 |---|---|
 | `GetIssue`, `GetIssues` | **Strong** — reads issues directly |
-| `SearchReconciled(..., issueIDs)` | Strong **for the ids named** (max 50), eventual for the rest |
-| `Search` | Eventual |
+| `Search` with `SearchQuery.ReconcileIssues` | Strong **for the ids named** (max 50), eventual for the rest |
+| `Search`, `SearchIssues` | Eventual |
 
-`Search` also returns a `SearchResult.Warnings` via `SearchReconciled` — worth checking, because a
-JQL that Jira warned about still returns HTTP 200 with an empty result set, making a broken query
-indistinguishable from one that legitimately matched nothing.
+`Search` also returns `SearchResult.Warnings` — worth checking, because a JQL that Jira warned about
+still returns HTTP 200 with an empty result set, making a broken query indistinguishable from one
+that legitimately matched nothing.
 
-### Rate limits
+### Retries and rate limits
 
-`DefaultRetryPolicy` follows Atlassian's published guidance: exponential backoff with jitter, never
-shorter than the server's `Retry-After`. On a 429, `APIError` carries `RateLimitReason` (which ceiling
-was hit — global, tenant, burst, or per-issue-on-write), `RateLimitReset` (when the quota refills, so
-a large batch can schedule rather than spin) and `NearLimit`, Jira's advance warning that under 20% of
-quota remains.
+The client does not retry unless given a policy. `DefaultRetryPolicy` follows Atlassian's published
+guidance — exponential backoff with jitter, never shorter than the server's `Retry-After`:
+
+| Response | Retried? |
+|---|---|
+| 429 | Always. Jira refused the request before executing it, so sending it again is safe. |
+| 5xx on a read, a `PUT`, a `DELETE` or an upsert | Yes. A second execution leaves the same state. |
+| 5xx on a create — issue, comment, worklog, link, attachment, transition | **No.** A gateway can time out after Jira stored the write, and a replay would file it twice. Set `RetryPolicy.RetryNonIdempotent` to accept that risk. |
+| `Retry-After` longer than `RetryPolicy.MaxRetryAfter` (one minute by default) | No. The error comes back at once with `APIError.RetryAfter`, so the work can be rescheduled. |
+
+On a 429, `APIError` carries `RateLimitReason` (which ceiling was hit — global, tenant, burst, or
+per-issue-on-write), `RateLimitReset` (when the quota refills) and `NearLimit`.
 
 `ErrLimitExceeded` (HTTP 413) is a different thing entirely: a permanent per-issue ceiling — 5,000
 comments or worklogs, 2,000 attachments or links on one issue. Retrying never clears it.
+
+### Errors
+
+```go
+switch {
+case errors.Is(err, jiraclient.ErrNotFound):
+case errors.Is(err, jiraclient.ErrUnauthorized):
+case errors.Is(err, jiraclient.ErrRateLimited):       // 429, transient — back off
+case errors.Is(err, jiraclient.ErrLimitExceeded):     // 413, permanent — retrying will not help
+case errors.Is(err, jiraclient.ErrPaginationStalled): // Jira stopped advancing a listing
+case errors.Is(err, jiraclient.ErrInvalidArgument):   // rejected before any request was sent
+}
+
+var apiErr *jiraclient.APIError
+if errors.As(err, &apiErr) {
+    // apiErr.Messages carries Jira's own explanation — a 400 on a bad ADF document
+    // names the node it rejected.
+    log.Printf("status %d: %v (%s)", apiErr.StatusCode, apiErr.Messages, apiErr.RateLimitReason)
+}
+```
+
+## What it covers
+
+| Area | Methods |
+|---|---|
+| Search | `Search`, `SearchIssues`, `ApproximateCount`, `ValidateJQL`, `JQLQuote`, `JQLList` |
+| Issues | `GetIssue`, `GetIssues`, `CreateIssue`, `UpdateIssue`, `UpdateSummary`, `UpdateCustomField`, `SetAssignee`, `AddLabel`, `RemoveLabel`, `DeleteIssue` |
+| Workflow | `Transitions`, `ApplyTransition`, `Transition`, `TransitionByName`, and their `…WithComment` forms |
+| Comments | `Comments`, `AddComment`, `AddTextComment`, `AddRestrictedComment`, `UpdateComment`, `DeleteComment` |
+| Rich text (ADF) | `NewDocBuilder`, `TextDoc`, `LiteralDoc`, `ADFDoc.Text` |
+| Issue links | `LinkIssues`, `CreateLink`, `GetIssueLink`, `DeleteIssueLink`, `LinkTypes`, `LinkTypeIDByName`, `Issue.Links` |
+| Remote links | `RemoteLinks`, `SetRemoteLink`, `DeleteRemoteLink`, `DeleteRemoteLinkByGlobalID` |
+| History | `Changelog`, `Changelogs` |
+| Attachments | `AddAttachment`, `GetAttachment`, `DownloadAttachment`, `DeleteAttachment`, `AttachmentSettings` |
+| Worklogs | `Worklogs`, `WorklogsStarted`, `GetWorklog`, `AddWorklog`, `UpdateWorklog`, `DeleteWorklog` |
+| Issue properties | `IssuePropertyKeys`, `GetIssueProperty`, `SetIssueProperty`, `DeleteIssueProperty` |
+| Watchers | `Watchers`, `AddWatcher`, `RemoveWatcher` |
+| Fields | `Fields`, `FieldsByName`, `FieldIDByName`, `Issue.RawFields`, `Issue.FieldText`, `Issue.DecodeField` |
+| Projects and site | `Projects`, `GetProject`, `ProjectStatuses`, `Priorities`, `PriorityRanks`, `ServerInfo` |
+| People and permissions | `Myself`, `SearchUsers`, `AccountIDByEmail`, `MyPermissions` |
+
+Not covered: the Jira Software (boards, sprints) and Jira Service Management APIs, bulk create and
+bulk edit, create/edit metadata, filters, webhooks, and administration.
+
+## Staying ahead of Jira API changes
+
+Atlassian marks an endpoint it is going to remove with `Deprecation` and `Sunset` response headers,
+at least six months ahead. A client with a logger reports them, once per notice:
+
+```
+jira: GET /rest/api/3/… is deprecated and scheduled for removal (Deprecation: "@1767225600", Sunset: "Wed, 01 Jul 2026 00:00:00 GMT", Link: "<…>; rel=\"deprecation\"")
+```
+
+Alert on `is deprecated and scheduled for removal` in a service's logs and the removal is known
+months before it happens rather than on the day. Without a logger the client stays silent, so pass
+`WithLogger` in production. The changes themselves are announced in the
+[Jira Cloud platform changelog](https://developer.atlassian.com/cloud/jira/platform/changelog/).
+
+## Authentication
+
+Jira Cloud basic auth: the account email plus an API token.
+
+- API tokens **expire** — between 1 and 365 days after creation, a year by default — so a 401 on a
+  call that used to work usually means the token needs reissuing rather than that permissions
+  changed. `Myself` at startup is the cheapest check.
+- **Scoped** API tokens, the only kind a service account can have, do not work against the site URL.
+  Atlassian serves them through its gateway, so the base URL is the gateway's and the site URL is
+  given separately for links:
+
+```go
+client := jiraclient.NewClient(
+    "https://api.atlassian.com/ex/jira/"+cloudID,
+    "bot@example.com",
+    scopedToken,
+    jiraclient.WithSiteURL("https://your-site.atlassian.net"),   // where IssueURL and [issue:KEY] point
+)
+```
+
+## Stability and versioning
+
+The module is pre-1.0. While the major version is `0` the exported API may change between minor
+releases; every such change, and every change in behaviour, is listed in
+[CHANGELOG.md](CHANGELOG.md) with the fix for it. Patch releases never break the API. Pin a version
+in `go.mod` and read the changelog before raising it.
+
+The `go` directive names the oldest Go release the package builds with (1.22), not a preference: a
+consumer on a newer toolchain gets that toolchain's standard library and its security fixes
+regardless.
+
+## Notes
+
+- REST **v3** throughout, because it is ADF-native. v2 is *not* deprecated — Atlassian maintains both
+  and documents them as offering the same operations. `/rest/api/latest` resolves to v2 semantics, so
+  it is not a safe alias for v3.
+- Arguments that cannot possibly succeed — an over-long summary, a label containing whitespace, an
+  empty document, a self-link, more than 50 reconcile ids — are rejected locally as
+  `ErrInvalidArgument` rather than sent.
+- The client is safe for concurrent use.
+- Run `go test -race ./...` and `golangci-lint run` before tagging a release.
 
 ## License
 

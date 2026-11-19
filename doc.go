@@ -28,6 +28,12 @@
 // Mutations are verb-first — Add…, Set…, Update…, Delete… — and every one of them is suppressed on
 // a dry-run client.
 //
+// # Fields
+//
+// [Issue] has a member for the fields nearly every automation reads. Any other field — a custom
+// field above all — is returned in [Issue.RawFields] when its ID is among the fields requested, and
+// read with [Issue.FieldText] or [Issue.DecodeField]. [Client.FieldIDByName] resolves the ID.
+//
 // # Consistency
 //
 // Not all reads are equal, and picking the wrong one is the classic cause of "my automation did not
@@ -42,13 +48,27 @@
 // # Errors
 //
 // Failures that callers routinely branch on are available as sentinels for errors.Is:
-// [ErrNotFound], [ErrUnauthorized], [ErrRateLimited], [ErrLimitExceeded] and [ErrInvalidArgument].
+// [ErrNotFound], [ErrUnauthorized], [ErrRateLimited], [ErrLimitExceeded], [ErrPaginationStalled] and
+// [ErrInvalidArgument].
 // Anything else unwraps to an [*APIError] carrying Jira's own message, which is where the actionable
 // detail lives — a 400 on a malformed document names the node it rejected.
 //
 // [ErrRateLimited] (429) is transient and worth retrying; the client already does so per its
 // [RetryPolicy]. [ErrLimitExceeded] (413) is a permanent per-issue ceiling — 5,000 comments or
 // worklogs, 2,000 attachments or links on one issue — and retrying never clears it.
+//
+// # Retries
+//
+// The client retries only when given a [RetryPolicy]. A 429 is always retried, because Jira refused
+// the request before executing it. A 5xx is retried only for a request that is safe to send twice —
+// a read, a PUT, a DELETE, an upsert — and not for one that creates something, since a gateway can
+// time out after Jira stored the write and a replay would store it again.
+//
+// # Deprecations
+//
+// Jira announces the removal of an endpoint through Deprecation and Sunset response headers. A
+// client given a logger with [WithLogger] reports each such notice once, which is the earliest
+// warning a running service gets that a call it depends on is going away.
 //
 // [ErrInvalidArgument] means the call was rejected locally, before any request was sent. The client
 // refuses arguments that cannot possibly succeed rather than spending a round trip discovering it.

@@ -1,6 +1,11 @@
 package jiraclient
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,8 +35,16 @@ type Issue struct {
 	// Comments holds each comment's body as plain text, oldest first. Populated only when "comment"
 	// is among the requested fields; Jira omits it otherwise.
 	Comments []Comment
-	Created  time.Time
-	Updated  time.Time
+	// Links are the issue's links to other issues, each naming both ends. Populated only when
+	// "issuelinks" is among the requested fields.
+	Links   []IssueLink
+	Created time.Time
+	Updated time.Time
+	// RawFields holds every field Jira returned that has no member above — custom fields first among
+	// them — as raw JSON keyed by field ID. A field is here only if it was asked for, so pass its ID
+	// in the fields argument of the read ("customfield_10004"; Client.FieldIDByName finds it). Read
+	// one with DecodeField or FieldText. Nil when there are none.
+	RawFields map[string]json.RawMessage
 }
 
 // Comment is one comment on an issue, with its body flattened to plain text.
@@ -39,7 +52,11 @@ type Comment struct {
 	ID       string
 	Body     string
 	AuthorID string
-	Created  time.Time
+	// AuthorName is the display name, empty for a comment left by a since-deleted account.
+	AuthorName string
+	Created    time.Time
+	// Updated is when the body was last edited, equal to Created for a comment never touched since.
+	Updated time.Time
 }
 
 // Status category keys. These are fixed by Jira and are the same on every site, unlike status names.
@@ -65,6 +82,90 @@ func (i Issue) HasLabel(label string) bool {
 		}
 	}
 	return false
+}
+
+// DecodeField unmarshals one of RawFields into dest. It reports false, and no error, when the field
+// is absent or null: Jira omits a field that was not requested and sends null for one that is unset,
+// and neither is a failure.
+func (i Issue) DecodeField(fieldID string, dest any) (bool, error) {
+	raw, present := i.RawFields[fieldID]
+	if present == false || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) == true {
+		return false, nil
+	}
+	if err := json.Unmarshal(raw, dest); err != nil {
+		return false, fmt.Errorf("decode field %s on %s: %w", fieldID, i.Key, err)
+	}
+	return true, nil
+}
+
+// FieldText renders one of RawFields as text without the caller knowing which of Jira's shapes the
+// field uses: a string or number as itself, a select option as its value (a cascading one as
+// "Parent - Child"), a user as their display name, a version, component or sprint as its name, an
+// issue as its key, rich text as plain text, and a list as its items separated by ", ".
+//
+// It is empty for a field that is absent, unset, or of a shape none of those cover. Use DecodeField
+// when the exact value matters.
+func (i Issue) FieldText(fieldID string) string {
+	raw, present := i.RawFields[fieldID]
+	if present == false {
+		return ""
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return ""
+	}
+	return fieldValueText(value)
+}
+
+// fieldValueLabels are the keys Jira puts a value's human-readable form under, most specific first.
+var fieldValueLabels = []string{"value", "displayName", "name", "key"}
+
+// fieldValueText renders a decoded field value. See Issue.FieldText for the shapes it knows.
+func fieldValueText(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case bool:
+		return strconv.FormatBool(typed)
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, element := range typed {
+			if text := fieldValueText(element); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, ", ")
+	case map[string]any:
+		if typed["type"] == adfDoc {
+			return adfValueText(typed)
+		}
+		for _, label := range fieldValueLabels {
+			text, isText := typed[label].(string)
+			if isText == false || text == "" {
+				continue
+			}
+			if child := fieldValueText(typed["child"]); child != "" {
+				text += " - " + child
+			}
+			return text
+		}
+	}
+	return ""
+}
+
+// adfValueText renders a rich-text field value, which arrives as an ADF document.
+func adfValueText(value map[string]any) string {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	var doc ADFDoc
+	if err := json.Unmarshal(encoded, &doc); err != nil {
+		return ""
+	}
+	return doc.Text()
 }
 
 // SearchFields is the default field set requested by Search. Requesting only what is needed matters:
@@ -107,28 +208,66 @@ type rawIssue struct {
 }
 
 type rawFields struct {
-	Summary     string       `json:"summary"`
-	Description *ADFDoc      `json:"description"`
-	Labels      []string     `json:"labels"`
-	Created     string       `json:"created"`
-	Updated     string       `json:"updated"`
-	Status      *rawNamed    `json:"status"`
-	Priority    *rawNamed    `json:"priority"`
-	IssueType   *rawNamed    `json:"issuetype"`
-	Resolution  *rawNamed    `json:"resolution"`
-	Assignee    *rawUser     `json:"assignee"`
-	Reporter    *rawUser     `json:"reporter"`
-	Comment     *rawComments `json:"comment"`
+	Summary     string         `json:"summary"`
+	Description *ADFDoc        `json:"description"`
+	Labels      []string       `json:"labels"`
+	Created     string         `json:"created"`
+	Updated     string         `json:"updated"`
+	Status      *rawNamed      `json:"status"`
+	Priority    *rawNamed      `json:"priority"`
+	IssueType   *rawNamed      `json:"issuetype"`
+	Resolution  *rawNamed      `json:"resolution"`
+	Assignee    *rawUser       `json:"assignee"`
+	Reporter    *rawUser       `json:"reporter"`
+	Comment     *rawComments   `json:"comment"`
+	IssueLinks  []rawIssueLink `json:"issuelinks"`
+	// Other is every field with no member above, kept as Jira sent it. It becomes Issue.RawFields.
+	Other map[string]json.RawMessage `json:"-"`
+}
+
+// modelledFields are the field IDs rawFields decodes into members, read off its own JSON tags so the
+// set cannot drift from the struct.
+var modelledFields = func() map[string]bool {
+	fields := map[string]bool{}
+	shape := reflect.TypeOf(rawFields{})
+	for index := 0; index < shape.NumField(); index++ {
+		name, _, _ := strings.Cut(shape.Field(index).Tag.Get("json"), ",")
+		if name != "" && name != "-" {
+			fields[name] = true
+		}
+	}
+	return fields
+}()
+
+// UnmarshalJSON decodes the modelled fields into their members and keeps the rest in Other.
+func (f *rawFields) UnmarshalJSON(data []byte) error {
+	// A method-less twin, so decoding into it does not call this method again.
+	type modelled rawFields
+	var typed modelled
+	if err := json.Unmarshal(data, &typed); err != nil {
+		return err
+	}
+
+	var all map[string]json.RawMessage
+	if err := json.Unmarshal(data, &all); err != nil {
+		return err
+	}
+	for fieldID := range all {
+		if modelledFields[fieldID] == true {
+			delete(all, fieldID)
+		}
+	}
+
+	*f = rawFields(typed)
+	if len(all) > 0 {
+		f.Other = all
+	}
+	return nil
 }
 
 // rawComments is the paginated comment container Jira nests under the "comment" field.
 type rawComments struct {
-	Comments []struct {
-		ID      string   `json:"id"`
-		Body    *ADFDoc  `json:"body"`
-		Author  *rawUser `json:"author"`
-		Created string   `json:"created"`
-	} `json:"comments"`
+	Comments []rawComment `json:"comments"`
 }
 
 type rawNamed struct {
@@ -196,16 +335,16 @@ func (r rawIssue) toIssue() Issue {
 	if r.Fields.Comment != nil {
 		issue.Comments = make([]Comment, 0, len(r.Fields.Comment.Comments))
 		for _, raw := range r.Fields.Comment.Comments {
-			comment := Comment{ID: raw.ID, Created: parseJiraTime(raw.Created)}
-			if raw.Body != nil {
-				comment.Body = raw.Body.Text()
-			}
-			if raw.Author != nil {
-				comment.AuthorID = raw.Author.AccountID
-			}
-			issue.Comments = append(issue.Comments, comment)
+			issue.Comments = append(issue.Comments, raw.toComment())
 		}
 	}
+	if len(r.Fields.IssueLinks) > 0 {
+		issue.Links = make([]IssueLink, 0, len(r.Fields.IssueLinks))
+		for _, raw := range r.Fields.IssueLinks {
+			issue.Links = append(issue.Links, raw.toIssueLink(r.Key))
+		}
+	}
+	issue.RawFields = r.Fields.Other
 	issue.Created = parseJiraTime(r.Fields.Created)
 	issue.Updated = parseJiraTime(r.Fields.Updated)
 	return issue

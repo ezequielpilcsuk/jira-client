@@ -181,12 +181,20 @@ func NewDocBuilder() *DocBuilder {
 
 // NewDocBuilder returns a builder that renders "[issue:KEY]" tokens as links into this client's site.
 func (c *Client) NewDocBuilder() *DocBuilder {
-	return &DocBuilder{issueBaseURL: strings.TrimRight(c.baseURL, "/")}
+	return &DocBuilder{issueBaseURL: c.browseBase()}
 }
 
 // IssueURL is the human-facing URL for an issue key on this client's site.
 func (c *Client) IssueURL(key string) string {
-	return strings.TrimRight(c.baseURL, "/") + "/browse/" + key
+	return c.browseBase() + "/browse/" + key
+}
+
+// browseBase is the site root that issue pages live under.
+func (c *Client) browseBase() string {
+	if c.siteURL != "" {
+		return c.siteURL
+	}
+	return strings.TrimRight(c.baseURL, "/")
 }
 
 // AddHeading appends a heading. Levels outside 1-6 are clamped to 3.

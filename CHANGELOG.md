@@ -6,6 +6,59 @@ releases** — every such change is listed here with the mechanical fix. Patch r
 At 1.0 the API freezes under semantic versioning, which is why the warts below are being removed now
 rather than lived with forever.
 
+## v0.11.0 (unreleased)
+
+No exported signature changed: code written against v0.10.0 compiles as it is. Several behaviours
+did change, each of them a fix, and they come first because they are what an upgrade can notice.
+
+### Behaviour changes
+
+| What | Before | Now |
+|---|---|---|
+| A 5xx on a create — issue, comment, worklog, link, attachment, transition | Retried under `RetryServerErrors`. A gateway timing out after Jira stored the write meant the retry filed it twice. | Returned to the caller. 429s are still retried, since Jira refuses those before executing anything. Set `RetryPolicy.RetryNonIdempotent` for the old behaviour. |
+| A `Retry-After` longer than a minute | Slept through, however long. | Returned at once as `ErrRateLimited` with `APIError.RetryAfter` set. The ceiling is `RetryPolicy.MaxRetryAfter`. |
+| A retry wait longer than the context has left | Slept to the deadline, then returned `context.DeadlineExceeded`, hiding the cause. | The API error is returned immediately. |
+| Cancelling during a retry wait | Returned the context error alone. | The error matches both `context.Canceled` and the failure being retried. |
+| `ADFDoc.Text()`, and so `Issue.Description` and comment bodies | Dropped smart-link URLs, ran table cells together (`12345` and `678` read as `12345678`), rendered a mention as its account id, and dropped link targets, emoji, statuses and dates. | Smart links render as their URL; a table is one row per line with ` \| ` between cells; a mention renders as the name Jira stored; a link whose text does not show its address is followed by it in brackets; emoji, statuses and dates render. |
+| `[@…]` in builder text | Anything between the brackets became a mention, so `[@]` produced invalid ADF and a 400 for the whole comment. | Only an account-id-shaped token (letters, digits, `:`, `-`, `_`) is a mention. |
+| `DocBuilder.Len()` and the summary limit | Counted bytes, refusing a 200-character accented summary as "400 chars". | Count characters, as Jira does. `Len()` also leaves link addresses out. |
+| `SearchQuery.ReconcileIssues` | Sent as given. | A value that is not a numeric issue id is refused as `ErrInvalidArgument`; Jira reconciles by id only. |
+| `TransitionByName` on `DryRunID` | Asked Jira for the placeholder's transitions and failed with a 404. | A no-op, like every other mutation given the placeholder. |
+| An unknown transition name | `transition "X" not available on KEY`. | The same, followed by the transitions that are available. |
+| `APIError.Messages` for field errors | In random order, so identical failures produced different error text. | Sorted by field name. |
+| `WithTimeout` after `WithHTTPClient` | Set the timeout on the caller's own `http.Client`. | Sets it on a copy. |
+
+### Fixed
+
+- An issue whose description held an image with a fractional width failed to decode, and took the
+  whole search page with it. `ADFAttrs` now skips attribute values it cannot read.
+- `Search` requested the same page for ever when Jira repeated a page token, and `Projects` did the
+  same when `isLast` never arrived. Both now stop with `ErrPaginationStalled`.
+- Backoff fell to no wait at all from the 34th attempt of a policy with a large `MaxAttempts`.
+- A `Retry-After` given as an HTTP date was ignored.
+
+### Added
+
+- **Reading custom fields** — `Issue.RawFields` holds every requested field that has no member on
+  `Issue`; `Issue.FieldText` renders one as text whatever shape Jira used, and `Issue.DecodeField`
+  unmarshals the exact value.
+- **`Issue.Links`** — an issue's links, each naming both ends, when `issuelinks` is requested. It is
+  where the ID `DeleteIssueLink` takes comes from.
+- **`UpdateIssue`** — several edits to one issue (summary, fields, label changes) in a single request,
+  with `NotifyUsers` to keep a bulk run quiet.
+- **`ApplyTransition`** — a transition by ID or name with a comment and the fields its screen
+  requires, such as a resolution.
+- **`SearchQuery.Limit`**, and searches whose query is too long for a URL are sent as a POST.
+- **`JQLQuote`** and **`JQLList`** for building JQL from values that are not constants.
+- **`DocBuilder.AddLiteral`** and **`LiteralDoc`** for text that must reach Jira exactly as written.
+- **Deprecation warnings** — a client with a logger reports, once per notice, any endpoint Jira
+  answers with `Deprecation` or `Sunset` headers.
+- **`WithSiteURL`** for clients whose base URL is Atlassian's API gateway, as scoped API tokens
+  require.
+- `Comment.AuthorName` and `Comment.Updated`; `RetryPolicy.MaxRetryAfter` and
+  `RetryPolicy.RetryNonIdempotent`; `ErrPaginationStalled`; `ADFAttrs.URL`, `Text`, `ShortName` and
+  `Timestamp`.
+
 ## v0.10.0
 
 Breaking changes, an API-quality pass ahead of a v1 freeze, plus attachments and worklogs.
