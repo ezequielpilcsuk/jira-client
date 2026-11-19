@@ -6,7 +6,7 @@ releases** — every such change is listed here with the mechanical fix. Patch r
 At 1.0 the API freezes under semantic versioning, which is why the warts below are being removed now
 rather than lived with forever.
 
-## v0.11.0 (unreleased)
+## v0.11.0
 
 No exported signature changed: code written against v0.10.0 compiles as it is. Several behaviours
 did change, each of them a fix, and they come first because they are what an upgrade can notice.
