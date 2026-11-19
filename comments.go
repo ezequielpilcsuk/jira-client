@@ -79,16 +79,17 @@ type rawComment struct {
 	Body    *ADFDoc  `json:"body"`
 	Author  *rawUser `json:"author"`
 	Created string   `json:"created"`
+	Updated string   `json:"updated"`
 }
 
 // toComment flattens a raw comment, tolerating an absent author or body.
 func (r rawComment) toComment() Comment {
-	comment := Comment{ID: r.ID, Created: parseJiraTime(r.Created)}
+	comment := Comment{ID: r.ID, Created: parseJiraTime(r.Created), Updated: parseJiraTime(r.Updated)}
 	if r.Body != nil {
 		comment.Body = r.Body.Text()
 	}
 	if r.Author != nil {
-		comment.AuthorID = r.Author.AccountID
+		comment.AuthorID, comment.AuthorName = r.Author.AccountID, r.Author.DisplayName
 	}
 	return comment
 }

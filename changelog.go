@@ -134,7 +134,7 @@ func (c *Client) Changelogs(ctx context.Context, issueIDsOrKeys, fieldIDs []stri
 				payload["nextPageToken"] = pageToken
 			}
 
-			body, err := c.do(ctx, "POST", apiBase+"/changelog/bulkfetch", payload)
+			body, err := c.postReplayable(ctx, apiBase+"/changelog/bulkfetch", payload)
 			if err != nil {
 				return nil, err
 			}

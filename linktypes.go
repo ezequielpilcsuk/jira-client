@@ -114,41 +114,52 @@ func (c *Client) GetIssueLink(ctx context.Context, linkID string) (IssueLink, er
 		return IssueLink{}, err
 	}
 
-	var raw struct {
-		ID   string `json:"id"`
-		Type *struct {
-			ID      string `json:"id"`
-			Name    string `json:"name"`
-			Inward  string `json:"inward"`
-			Outward string `json:"outward"`
-		} `json:"type"`
-		InwardIssue *struct {
-			Key string `json:"key"`
-		} `json:"inwardIssue"`
-		OutwardIssue *struct {
-			Key string `json:"key"`
-		} `json:"outwardIssue"`
-	}
+	var raw rawIssueLink
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return IssueLink{}, fmt.Errorf("decode issue link %s: %w", linkID, err)
 	}
+	return raw.toIssueLink(""), nil
+}
 
-	link := IssueLink{ID: raw.ID}
-	if raw.Type != nil {
+// rawIssueLink mirrors Jira's issue link payload. Each end is a pointer because Jira leaves one out:
+// the end the caller cannot see when a link is read on its own, and the near end — the issue being
+// read — when the link arrives inside an issue's own link list.
+type rawIssueLink struct {
+	ID   string `json:"id"`
+	Type *struct {
+		ID      string `json:"id"`
+		Name    string `json:"name"`
+		Inward  string `json:"inward"`
+		Outward string `json:"outward"`
+	} `json:"type"`
+	InwardIssue *struct {
+		Key string `json:"key"`
+	} `json:"inwardIssue"`
+	OutwardIssue *struct {
+		Key string `json:"key"`
+	} `json:"outwardIssue"`
+}
+
+// toIssueLink flattens a raw link. missingEnd is the key to give whichever end Jira left out: the
+// issue's own key for a link taken from that issue's list, and "" for a link read on its own, where
+// an absent end means the caller cannot see it.
+func (r rawIssueLink) toIssueLink(missingEnd string) IssueLink {
+	link := IssueLink{ID: r.ID, InwardKey: missingEnd, OutwardKey: missingEnd}
+	if r.Type != nil {
 		link.Type = LinkType{
-			ID:      raw.Type.ID,
-			Name:    raw.Type.Name,
-			Inward:  raw.Type.Inward,
-			Outward: raw.Type.Outward,
+			ID:      r.Type.ID,
+			Name:    r.Type.Name,
+			Inward:  r.Type.Inward,
+			Outward: r.Type.Outward,
 		}
 	}
-	if raw.InwardIssue != nil {
-		link.InwardKey = raw.InwardIssue.Key
+	if r.InwardIssue != nil {
+		link.InwardKey = r.InwardIssue.Key
 	}
-	if raw.OutwardIssue != nil {
-		link.OutwardKey = raw.OutwardIssue.Key
+	if r.OutwardIssue != nil {
+		link.OutwardKey = r.OutwardIssue.Key
 	}
-	return link, nil
+	return link
 }
 
 // DeleteIssueLink removes an issue link. It takes the link's own ID, not either issue's — GetIssueLink

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 )
@@ -30,6 +31,12 @@ var (
 
 	// ErrInvalidArgument is returned for arguments rejected before any request is sent.
 	ErrInvalidArgument = errors.New("invalid argument")
+
+	// ErrPaginationStalled is returned when a listing stops making progress: Jira hands back a page
+	// token it has already issued, or keeps answering with empty pages without ever marking the last
+	// one. The client gives up rather than request the same page indefinitely, and returns nothing
+	// rather than a result it cannot vouch for as complete.
+	ErrPaginationStalled = errors.New("jira pagination did not advance")
 )
 
 // APIError carries a non-2xx Jira response. Jira puts the actionable detail in the body — a 400 on a
@@ -101,8 +108,15 @@ func newAPIError(statusCode int, operation string, body []byte) *APIError {
 	var parsed jiraErrorBody
 	if json.Unmarshal(body, &parsed) == nil {
 		apiErr.Messages = append(apiErr.Messages, parsed.ErrorMessages...)
-		for field, message := range parsed.Errors {
-			apiErr.Messages = append(apiErr.Messages, field+": "+message)
+		// Sorted by field: map order is random, and an error whose text changes between identical
+		// failures cannot be grouped by whatever collects the logs.
+		fields := make([]string, 0, len(parsed.Errors))
+		for field := range parsed.Errors {
+			fields = append(fields, field)
+		}
+		slices.Sort(fields)
+		for _, field := range fields {
+			apiErr.Messages = append(apiErr.Messages, field+": "+parsed.Errors[field])
 		}
 	}
 	return apiErr

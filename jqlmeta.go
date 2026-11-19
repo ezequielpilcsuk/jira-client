@@ -27,7 +27,7 @@ func (c *Client) ApproximateCount(ctx context.Context, jql string) (int, error) 
 		return 0, fmt.Errorf("%w: jql cannot be empty", ErrInvalidArgument)
 	}
 
-	body, err := c.do(ctx, "POST", apiBase+"/search/approximate-count",
+	body, err := c.postReplayable(ctx, apiBase+"/search/approximate-count",
 		map[string]any{"jql": jql})
 	if err != nil {
 		return 0, err
@@ -74,7 +74,7 @@ func (c *Client) ValidateJQL(ctx context.Context, jql ...string) ([]JQLResult, e
 	params := url.Values{}
 	params.Set("validation", jqlValidationStrict)
 
-	body, err := c.do(ctx, "POST", buildPath("/jql/parse", params),
+	body, err := c.postReplayable(ctx, buildPath("/jql/parse", params),
 		map[string]any{"queries": jql})
 	if err != nil {
 		return nil, err
@@ -167,4 +167,52 @@ func (c *Client) MyPermissions(ctx context.Context, scope PermissionScope, keys 
 		held[key] = permission.HavePermission
 	}
 	return held, nil
+}
+
+// JQLQuote renders a value as a quoted JQL string, escaping whatever would end the string early or be
+// read as an escape.
+//
+// Pasting a value between quotes with fmt works until the value holds a quote of its own — and when
+// the value came from outside, a ticket title or a product name, it lets that text rewrite the query.
+// Quote every value that is not a constant in the source:
+//
+//	jql := "project = ABC AND summary ~ " + jiraclient.JQLQuote(title)
+//
+// Quoting settles where the string ends, not how Jira searches it: a value given to the ~ operator is
+// still read by Jira's text-search syntax, wildcards and all.
+func JQLQuote(value string) string {
+	var quoted strings.Builder
+	quoted.Grow(len(value) + 2)
+	quoted.WriteByte('"')
+	for _, char := range value {
+		switch {
+		case char == '"':
+			quoted.WriteString(`\"`)
+		case char == '\\':
+			quoted.WriteString(`\\`)
+		case char == '\n':
+			quoted.WriteString(`\n`)
+		case char == '\r':
+			quoted.WriteString(`\r`)
+		case char == '\t':
+			quoted.WriteString(`\t`)
+		case char < 0x20 || char == 0x7f:
+			fmt.Fprintf(&quoted, `\u%04x`, char)
+		default:
+			quoted.WriteRune(char)
+		}
+	}
+	quoted.WriteByte('"')
+	return quoted.String()
+}
+
+// JQLList renders values as the quoted, parenthesised list IN and NOT IN take:
+// JQLList("a", "b") is ("a", "b"). Jira rejects an empty list, so check there is something to ask
+// about before building the query.
+func JQLList(values ...string) string {
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, JQLQuote(value))
+	}
+	return "(" + strings.Join(quoted, ", ") + ")"
 }

@@ -11,9 +11,10 @@ import (
 
 // Retry defaults. Jira documents exponential backoff with jitter, honouring Retry-After as a minimum.
 const (
-	defaultMaxAttempts = 4
-	defaultBaseDelay   = 2 * time.Second
-	defaultMaxDelay    = 30 * time.Second
+	defaultMaxAttempts   = 4
+	defaultBaseDelay     = 2 * time.Second
+	defaultMaxDelay      = 30 * time.Second
+	defaultMaxRetryAfter = time.Minute
 )
 
 // RetryPolicy controls how transient failures are retried.
@@ -29,8 +30,19 @@ type RetryPolicy struct {
 	BaseDelay time.Duration
 	// MaxDelay caps the backoff.
 	MaxDelay time.Duration
-	// RetryServerErrors also retries 5xx responses, which Jira returns transiently under load.
+	// MaxRetryAfter is the longest server-requested wait the client will sit through. A response asking
+	// for more is returned at once, still carrying APIError.RetryAfter, so a caller can reschedule the
+	// work instead of holding a goroutine for as long as Jira says. Zero means one minute.
+	MaxRetryAfter time.Duration
+	// RetryServerErrors also retries 5xx responses, which Jira returns transiently under load. It
+	// covers requests that are safe to send twice; see RetryNonIdempotent for the rest.
 	RetryServerErrors bool
+	// RetryNonIdempotent extends RetryServerErrors to the writes that add something each time they
+	// run: creating an issue, a comment, a worklog or an issue link, uploading an attachment, applying
+	// a transition. It is off by default because a 5xx does not prove the write failed — a gateway can
+	// time out after Jira has stored it — and replaying then files the ticket twice. A 429 is refused
+	// before anything executes, so those are retried whatever this says.
+	RetryNonIdempotent bool
 }
 
 // DefaultRetryPolicy follows Atlassian's published guidance.
@@ -39,6 +51,7 @@ func DefaultRetryPolicy() RetryPolicy {
 		MaxAttempts:       defaultMaxAttempts,
 		BaseDelay:         defaultBaseDelay,
 		MaxDelay:          defaultMaxDelay,
+		MaxRetryAfter:     defaultMaxRetryAfter,
 		RetryServerErrors: true,
 	}
 }
@@ -50,7 +63,8 @@ func WithRetryPolicy(policy RetryPolicy) ClientOption {
 }
 
 // shouldRetry reports whether an error is worth another attempt, and how long to wait first.
-func (c *Client) shouldRetry(err error, attempt int) (time.Duration, bool) {
+// replayable says whether sending the same request a second time is harmless.
+func (c *Client) shouldRetry(err error, attempt int, replayable bool) (time.Duration, bool) {
 	if c.retry.MaxAttempts <= 1 || attempt >= c.retry.MaxAttempts {
 		return 0, false
 	}
@@ -60,9 +74,22 @@ func (c *Client) shouldRetry(err error, attempt int) (time.Duration, bool) {
 		return 0, false
 	}
 
-	retryable := apiErr.StatusCode == http.StatusTooManyRequests ||
-		(c.retry.RetryServerErrors == true && apiErr.StatusCode >= 500)
+	// A 429 was refused before Jira executed anything, so repeating it is safe whatever the request
+	// was. A 5xx says nothing about whether the request ran, so it is repeated only when a second
+	// execution would be harmless or the policy accepts the risk.
+	retryable := apiErr.StatusCode == http.StatusTooManyRequests
+	if apiErr.StatusCode >= 500 && c.retry.RetryServerErrors == true {
+		retryable = replayable == true || c.retry.RetryNonIdempotent == true
+	}
 	if retryable == false {
+		return 0, false
+	}
+
+	maxRetryAfter := c.retry.MaxRetryAfter
+	if maxRetryAfter <= 0 {
+		maxRetryAfter = defaultMaxRetryAfter
+	}
+	if apiErr.RetryAfter > maxRetryAfter {
 		return 0, false
 	}
 
@@ -81,7 +108,16 @@ func (c *Client) backoff(attempt int, retryAfter time.Duration) time.Duration {
 		maxDelay = defaultMaxDelay
 	}
 
-	delay := base << (attempt - 1)
+	// Doubled step by step and checked before each multiplication: a bit shift by the attempt number
+	// overflows after a few dozen attempts and would come out as no wait at all.
+	delay := base
+	for doubling := 1; doubling < attempt && delay < maxDelay; doubling++ {
+		if delay > maxDelay/2 {
+			delay = maxDelay
+			break
+		}
+		delay *= 2
+	}
 	if delay > maxDelay {
 		delay = maxDelay
 	}
@@ -115,15 +151,23 @@ func parseRateLimitReset(header http.Header) time.Time {
 	return parseJiraTime(raw)
 }
 
-// parseRetryAfter reads the Retry-After header, which Jira sends in seconds.
+// parseRetryAfter reads the Retry-After header. Jira documents it in seconds; HTTP also allows a date,
+// which is accepted so an intermediary answering in that form is still honoured.
 func parseRetryAfter(header http.Header) time.Duration {
 	raw := header.Get("Retry-After")
 	if raw == "" {
 		return 0
 	}
-	seconds, err := strconv.Atoi(raw)
-	if err != nil || seconds < 0 {
-		return 0
+	if seconds, err := strconv.Atoi(raw); err == nil {
+		if seconds < 0 {
+			return 0
+		}
+		return time.Duration(seconds) * time.Second
 	}
-	return time.Duration(seconds) * time.Second
+	if when, err := http.ParseTime(raw); err == nil {
+		if wait := time.Until(when); wait > 0 {
+			return wait
+		}
+	}
+	return 0
 }

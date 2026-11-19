@@ -176,7 +176,14 @@ func (c *Client) SetRemoteLink(ctx context.Context, key string, input RemoteLink
 		}
 	}
 
-	body, err := c.do(ctx, "POST", apiBase+"/issue/"+url.PathEscape(key)+"/remotelink", payload)
+	// Keyed on a GlobalID the POST is an upsert, so a replay rewrites the same link. Without one each
+	// send adds another.
+	body, _, err := c.doRequest(ctx, request{
+		Method:     "POST",
+		Path:       apiBase + "/issue/" + url.PathEscape(key) + "/remotelink",
+		Payload:    payload,
+		Replayable: input.GlobalID != "",
+	})
 	if err != nil {
 		return 0, err
 	}

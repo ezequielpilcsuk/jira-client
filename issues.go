@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // SummaryMaxChars is Jira's hard limit on the summary field. Exceeding it rejects the whole edit, so
@@ -24,6 +25,11 @@ const (
 // maxReconcileIssues is Jira's cap on the reconcileIssues parameter.
 const maxReconcileIssues = 50
 
+// maxSearchQueryBytes is the longest query string a search is sent with. Past it the search goes in a
+// POST body: Jira serves the same search on both verbs, and a URL of several kilobytes is turned away
+// by a gateway before Jira ever sees it.
+const maxSearchQueryBytes = 6000
+
 // SearchQuery describes a JQL search. The zero value beyond JQL is the common case.
 type SearchQuery struct {
 	// JQL is the query. Required.
@@ -35,6 +41,9 @@ type SearchQuery struct {
 	// answering, giving read-after-write consistency for those issues only. Jira accepts at most 50.
 	// Leave empty unless you are searching for something you just wrote.
 	ReconcileIssues []string
+	// Limit stops the search once this many issues are in, sparing the requests for the rest. Zero
+	// returns every match. Give the JQL an ORDER BY so the issues kept are the ones wanted.
+	Limit int
 }
 
 // SearchResult is a search's issues plus anything Jira wanted to say about the query itself.
@@ -49,8 +58,8 @@ type SearchResult struct {
 
 // Search runs a JQL query and returns every matching issue, following Jira's pagination to the end.
 //
-// The result set is unbounded — a broad JQL over a large project returns everything. Narrow the JQL
-// rather than relying on a limit.
+// The result set is unbounded unless SearchQuery.Limit is set — a broad JQL over a large project
+// returns everything. A query too long for a URL is sent as a POST instead; the result is the same.
 //
 // ⚠️ Search reads an index that is only eventually consistent. After a write, it can return stale
 // data or miss the issue entirely, for anything from seconds to minutes. To search for issues you
@@ -61,7 +70,19 @@ func (c *Client) Search(ctx context.Context, query SearchQuery) (SearchResult, e
 		return SearchResult{}, fmt.Errorf("%w: at most %d issues can be reconciled, got %d",
 			ErrInvalidArgument, maxReconcileIssues, len(query.ReconcileIssues))
 	}
-	return c.search(ctx, query.JQL, query.Fields, query.ReconcileIssues)
+	if query.Limit < 0 {
+		return SearchResult{}, fmt.Errorf("%w: limit cannot be negative, got %d", ErrInvalidArgument, query.Limit)
+	}
+	reconcileIDs := make([]int64, 0, len(query.ReconcileIssues))
+	for _, id := range query.ReconcileIssues {
+		numeric, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			return SearchResult{}, fmt.Errorf("%w: reconcile id %q is not a numeric issue id (use Issue.ID, not the key)",
+				ErrInvalidArgument, id)
+		}
+		reconcileIDs = append(reconcileIDs, numeric)
+	}
+	return c.search(ctx, query.JQL, query.Fields, reconcileIDs, query.Limit)
 }
 
 // SearchIssues is Search for the common case: a query, and only the issues back.
@@ -73,7 +94,7 @@ func (c *Client) SearchIssues(ctx context.Context, jql string, fields []string) 
 	return result.Issues, err
 }
 
-func (c *Client) search(ctx context.Context, jql string, fields, reconcileIDs []string) (SearchResult, error) {
+func (c *Client) search(ctx context.Context, jql string, fields []string, reconcileIDs []int64, limit int) (SearchResult, error) {
 	if strings.TrimSpace(jql) == "" {
 		return SearchResult{}, fmt.Errorf("%w: jql cannot be empty", ErrInvalidArgument)
 	}
@@ -83,21 +104,15 @@ func (c *Client) search(ctx context.Context, jql string, fields, reconcileIDs []
 
 	var result SearchResult
 	seenWarning := map[string]bool{}
+	seenToken := map[string]bool{}
 	pageToken := ""
 	for {
-		query := url.Values{}
-		query.Set("jql", jql)
-		query.Set("maxResults", strconv.Itoa(c.pageSize))
-		query.Set("fields", strings.Join(fields, ","))
-		// Reconciliation is re-sent on every page: it qualifies the query, not one response.
-		for _, id := range reconcileIDs {
-			query.Add("reconcileIssues", id)
-		}
-		if pageToken != "" {
-			query.Set("nextPageToken", pageToken)
+		pageSize := c.pageSize
+		if remaining := limit - len(result.Issues); limit > 0 && remaining < pageSize {
+			pageSize = remaining
 		}
 
-		body, err := c.do(ctx, "GET", buildPath("/search/jql", query), nil)
+		body, err := c.searchPage(ctx, jql, fields, reconcileIDs, pageToken, pageSize)
 		if err != nil {
 			return SearchResult{}, err
 		}
@@ -116,12 +131,52 @@ func (c *Client) search(ctx context.Context, jql string, fields, reconcileIDs []
 			}
 		}
 
+		if limit > 0 && len(result.Issues) >= limit {
+			// Jira sizes pages as it sees fit, so the cut is made here rather than trusted to it.
+			result.Issues = result.Issues[:limit]
+			break
+		}
 		if page.IsLast == true || page.NextPageToken == "" {
 			break
 		}
+		// A token Jira has already issued leads back to a page already read, and from there round
+		// again without end.
+		if seenToken[page.NextPageToken] == true {
+			return SearchResult{}, fmt.Errorf("%w: search returned a page token it had already issued",
+				ErrPaginationStalled)
+		}
+		seenToken[page.NextPageToken] = true
 		pageToken = page.NextPageToken
 	}
 	return result, nil
+}
+
+// searchPage fetches one page of a search, in the URL when the query fits there and in a POST body
+// when it does not.
+func (c *Client) searchPage(ctx context.Context, jql string, fields []string, reconcileIDs []int64, pageToken string, pageSize int) ([]byte, error) {
+	query := url.Values{}
+	query.Set("jql", jql)
+	query.Set("maxResults", strconv.Itoa(pageSize))
+	query.Set("fields", strings.Join(fields, ","))
+	// Reconciliation is re-sent on every page: it qualifies the query, not one response.
+	for _, id := range reconcileIDs {
+		query.Add("reconcileIssues", strconv.FormatInt(id, 10))
+	}
+	if pageToken != "" {
+		query.Set("nextPageToken", pageToken)
+	}
+	if len(query.Encode()) <= maxSearchQueryBytes {
+		return c.do(ctx, "GET", buildPath("/search/jql", query), nil)
+	}
+
+	payload := map[string]any{"jql": jql, "maxResults": pageSize, "fields": fields}
+	if len(reconcileIDs) > 0 {
+		payload["reconcileIssues"] = reconcileIDs
+	}
+	if pageToken != "" {
+		payload["nextPageToken"] = pageToken
+	}
+	return c.postReplayable(ctx, apiBase+"/search/jql", payload)
 }
 
 // GetIssue fetches a single issue by key or ID.
@@ -175,7 +230,7 @@ func (c *Client) GetIssues(ctx context.Context, keys []string, fields []string) 
 			"issueIdsOrKeys": keys[start:end],
 			"fields":         fields,
 		}
-		body, err := c.do(ctx, "POST", apiBase+"/issue/bulkfetch", payload)
+		body, err := c.postReplayable(ctx, apiBase+"/issue/bulkfetch", payload)
 		if err != nil {
 			return nil, err
 		}
@@ -214,9 +269,8 @@ func (c *Client) CreateIssue(ctx context.Context, input CreateIssueInput) (strin
 	if input.ProjectKey == "" || input.IssueType == "" || strings.TrimSpace(input.Summary) == "" {
 		return "", fmt.Errorf("%w: project, issue type and summary are required", ErrInvalidArgument)
 	}
-	if len(input.Summary) > SummaryMaxChars {
-		return "", fmt.Errorf("%w: summary is %d chars, over the %d limit",
-			ErrInvalidArgument, len(input.Summary), SummaryMaxChars)
+	if err := validateSummaryLength(input.Summary); err != nil {
+		return "", err
 	}
 	if c.skipMutation("CreateIssue", input.ProjectKey, input.Summary) == true {
 		return DryRunID, nil
@@ -279,14 +333,23 @@ func (c *Client) UpdateSummary(ctx context.Context, key, summary string) error {
 	if key == "" || strings.TrimSpace(summary) == "" {
 		return fmt.Errorf("%w: key and summary are required", ErrInvalidArgument)
 	}
-	if len(summary) > SummaryMaxChars {
-		return fmt.Errorf("%w: summary is %d chars, over the %d limit",
-			ErrInvalidArgument, len(summary), SummaryMaxChars)
+	if err := validateSummaryLength(summary); err != nil {
+		return err
 	}
 	if c.skipMutation("UpdateSummary", key, summary) == true {
 		return nil
 	}
 	return c.updateFields(ctx, key, map[string]any{"summary": summary})
+}
+
+// validateSummaryLength refuses a summary over Jira's limit, which counts characters rather than
+// bytes.
+func validateSummaryLength(summary string) error {
+	if size := utf8.RuneCountInString(summary); size > SummaryMaxChars {
+		return fmt.Errorf("%w: summary is %d chars, over the %d limit",
+			ErrInvalidArgument, size, SummaryMaxChars)
+	}
+	return nil
 }
 
 // UpdateCustomField sets a single custom field, e.g. UpdateCustomField(ctx, key,
@@ -341,9 +404,8 @@ func (c *Client) changeLabel(ctx context.Context, key, label, operation string) 
 	if key == "" || label == "" {
 		return fmt.Errorf("%w: key and label are required", ErrInvalidArgument)
 	}
-	// Jira labels cannot contain spaces; it rejects the edit rather than normalising.
-	if strings.ContainsAny(label, " \t\n") == true {
-		return fmt.Errorf("%w: label %q contains whitespace", ErrInvalidArgument, label)
+	if err := validateLabel(label); err != nil {
+		return err
 	}
 	if c.skipMutation("ChangeLabel", key, operation, label) == true {
 		return nil
@@ -354,6 +416,103 @@ func (c *Client) changeLabel(ctx context.Context, key, label, operation string) 
 			"labels": []map[string]string{{operation: label}},
 		},
 	})
+	return err
+}
+
+// validateLabel refuses a label Jira would reject. Labels cannot be empty or contain whitespace, and
+// Jira fails the whole edit rather than normalising one.
+func validateLabel(label string) error {
+	if label == "" {
+		return fmt.Errorf("%w: label cannot be empty", ErrInvalidArgument)
+	}
+	if strings.ContainsAny(label, " \t\n") == true {
+		return fmt.Errorf("%w: label %q contains whitespace", ErrInvalidArgument, label)
+	}
+	return nil
+}
+
+// IssueUpdate describes several edits to one issue, sent as a single request.
+type IssueUpdate struct {
+	// Summary replaces the summary. Empty leaves it alone.
+	Summary string
+	// Fields are set as given, keyed by field ID: a custom field ("customfield_10004": 3), or a system
+	// field in Jira's own shape ("priority": map[string]string{"name": "High"}).
+	Fields map[string]any
+	// AddLabels and RemoveLabels change the label set without replacing it, so labels someone else
+	// added survive the edit.
+	AddLabels    []string
+	RemoveLabels []string
+	// NotifyUsers controls whether watchers are emailed about the edit. Nil leaves Jira's default in
+	// place, which is to notify. Turning it off needs the Administer Jira or Administer projects
+	// permission.
+	NotifyUsers *bool
+}
+
+// UpdateIssue applies several edits to one issue in a single request.
+//
+// Jira limits writes per issue, so an automation that sets a field, renames the ticket and adjusts
+// its labels one call at a time spends three of that allowance where this spends one — and either all
+// of it is applied or none of it is.
+func (c *Client) UpdateIssue(ctx context.Context, key string, update IssueUpdate) error {
+	if key == "" {
+		return fmt.Errorf("%w: issue key cannot be empty", ErrInvalidArgument)
+	}
+
+	fields := make(map[string]any, len(update.Fields)+1)
+	for name, value := range update.Fields {
+		fields[name] = value
+	}
+	if update.Summary != "" {
+		if _, twice := fields["summary"]; twice == true {
+			return fmt.Errorf("%w: the summary is given both as Summary and in Fields", ErrInvalidArgument)
+		}
+		if strings.TrimSpace(update.Summary) == "" {
+			return fmt.Errorf("%w: summary cannot be blank", ErrInvalidArgument)
+		}
+		if err := validateSummaryLength(update.Summary); err != nil {
+			return err
+		}
+		fields["summary"] = update.Summary
+	}
+
+	labelChanges := make([]map[string]string, 0, len(update.AddLabels)+len(update.RemoveLabels))
+	for _, label := range update.AddLabels {
+		if err := validateLabel(label); err != nil {
+			return err
+		}
+		labelChanges = append(labelChanges, map[string]string{"add": label})
+	}
+	for _, label := range update.RemoveLabels {
+		if err := validateLabel(label); err != nil {
+			return err
+		}
+		labelChanges = append(labelChanges, map[string]string{"remove": label})
+	}
+	// Jira rejects an edit that both sets a field and applies changes to it.
+	if _, replaced := fields["labels"]; replaced == true && len(labelChanges) > 0 {
+		return fmt.Errorf("%w: labels are both replaced through Fields and changed through AddLabels or RemoveLabels",
+			ErrInvalidArgument)
+	}
+	if len(fields) == 0 && len(labelChanges) == 0 {
+		return fmt.Errorf("%w: the update changes nothing", ErrInvalidArgument)
+	}
+	if c.skipMutation("UpdateIssue", key) == true {
+		return nil
+	}
+
+	payload := map[string]any{}
+	if len(fields) > 0 {
+		payload["fields"] = fields
+	}
+	if len(labelChanges) > 0 {
+		payload["update"] = map[string]any{"labels": labelChanges}
+	}
+	query := url.Values{}
+	if update.NotifyUsers != nil {
+		query.Set("notifyUsers", strconv.FormatBool(*update.NotifyUsers))
+	}
+
+	_, err := c.do(ctx, "PUT", buildPath("/issue/"+url.PathEscape(key), query), payload)
 	return err
 }
 
@@ -370,7 +529,7 @@ func (c *Client) AddTextComment(ctx context.Context, key, text string) (Comment,
 // destination status ID — they differ, and using the wrong one silently 400s).
 // Use Transitions to discover the available IDs for an issue.
 func (c *Client) Transition(ctx context.Context, key, transitionID string) error {
-	return c.TransitionWithComment(ctx, key, transitionID, nil)
+	return c.ApplyTransition(ctx, key, TransitionInput{ID: transitionID})
 }
 
 // TransitionWithComment moves an issue through a transition and posts a comment as part of the same
@@ -378,22 +537,86 @@ func (c *Client) Transition(ctx context.Context, key, transitionID string) error
 // rejected — which is the reason to prefer it over a transition followed by a separate AddComment
 // when the comment explains the move. Pass a nil doc for no comment.
 func (c *Client) TransitionWithComment(ctx context.Context, key, transitionID string, comment *ADFDoc) error {
-	if key == "" || transitionID == "" {
-		return fmt.Errorf("%w: key and transition id are required", ErrInvalidArgument)
+	return c.ApplyTransition(ctx, key, TransitionInput{ID: transitionID, Comment: comment})
+}
+
+// TransitionInput describes a workflow transition to apply. Give it an ID or a Name, not both.
+type TransitionInput struct {
+	// ID is the transition's own ID, which is not the destination status ID.
+	ID string
+	// Name is the transition's display name, matched case-insensitively against what the issue
+	// currently offers. It costs one extra read and survives a site whose IDs differ.
+	Name string
+	// Comment is posted in the same request, so it cannot be orphaned by a transition Jira rejects.
+	Comment *ADFDoc
+	// Fields are set as the transition is applied, keyed by field ID. A workflow that demands a
+	// resolution on the way to done takes it here:
+	//
+	//	Fields: map[string]any{"resolution": map[string]string{"name": "Won't Do"}}
+	//
+	// Jira accepts only the fields on the transition's screen and rejects the request for any other.
+	Fields map[string]any
+}
+
+// ApplyTransition moves an issue through a workflow transition together with whatever the transition
+// needs alongside it: a comment, the fields its screen requires, or both. The other Transition…
+// methods are this with fewer arguments.
+func (c *Client) ApplyTransition(ctx context.Context, key string, input TransitionInput) error {
+	if key == "" {
+		return fmt.Errorf("%w: issue key cannot be empty", ErrInvalidArgument)
+	}
+	if (input.ID == "") == (input.Name == "") {
+		return fmt.Errorf("%w: a transition needs an id or a name, and only one of them", ErrInvalidArgument)
+	}
+	// DryRunID stands for an issue a dry run never created, so it has no transitions to look a name
+	// up in, and asking Jira would only report that the issue does not exist.
+	if key == DryRunID && c.skipMutation("Transition", key, input.ID+input.Name) == true {
+		return nil
+	}
+
+	transitionID := input.ID
+	if input.Name != "" {
+		resolved, err := c.transitionIDByName(ctx, key, input.Name)
+		if err != nil {
+			return err
+		}
+		transitionID = resolved
 	}
 	if c.skipMutation("Transition", key, transitionID) == true {
 		return nil
 	}
 
 	payload := map[string]any{"transition": map[string]string{"id": transitionID}}
-	if comment != nil {
+	if len(input.Fields) > 0 {
+		payload["fields"] = input.Fields
+	}
+	if input.Comment != nil {
 		payload["update"] = map[string]any{
-			"comment": []map[string]any{{"add": map[string]any{"body": comment}}},
+			"comment": []map[string]any{{"add": map[string]any{"body": input.Comment}}},
 		}
 	}
 
 	_, err := c.do(ctx, "POST", apiBase+"/issue/"+url.PathEscape(key)+"/transitions", payload)
 	return err
+}
+
+// transitionIDByName finds the transition an issue currently offers under a display name. When there
+// is none the error lists what the issue does offer, which is usually where the answer is.
+func (c *Client) transitionIDByName(ctx context.Context, key, name string) (string, error) {
+	options, err := c.Transitions(ctx, key)
+	if err != nil {
+		return "", err
+	}
+
+	available := make([]string, 0, len(options))
+	for _, option := range options {
+		if strings.EqualFold(option.Name, name) == true {
+			return option.ID, nil
+		}
+		available = append(available, option.Name)
+	}
+	return "", fmt.Errorf("%w: transition %q not available on %s (available: %s)",
+		ErrInvalidArgument, name, key, strings.Join(available, ", "))
 }
 
 // TransitionOption is a workflow transition available on an issue.
@@ -445,30 +668,12 @@ func (c *Client) Transitions(ctx context.Context, key string) ([]TransitionOptio
 // TransitionByName resolves a transition by its display name and applies it, so callers can say
 // "Won't Do" instead of depending on a numeric ID that differs between Jira sites.
 func (c *Client) TransitionByName(ctx context.Context, key, name string) error {
-	options, err := c.Transitions(ctx, key)
-	if err != nil {
-		return err
-	}
-	for _, option := range options {
-		if strings.EqualFold(option.Name, name) == true {
-			return c.Transition(ctx, key, option.ID)
-		}
-	}
-	return fmt.Errorf("%w: transition %q not available on %s", ErrInvalidArgument, name, key)
+	return c.ApplyTransition(ctx, key, TransitionInput{Name: name})
 }
 
 // TransitionByNameWithComment resolves a transition by name and posts a comment with it.
 func (c *Client) TransitionByNameWithComment(ctx context.Context, key, name string, comment *ADFDoc) error {
-	options, err := c.Transitions(ctx, key)
-	if err != nil {
-		return err
-	}
-	for _, option := range options {
-		if strings.EqualFold(option.Name, name) == true {
-			return c.TransitionWithComment(ctx, key, option.ID, comment)
-		}
-	}
-	return fmt.Errorf("%w: transition %q not available on %s", ErrInvalidArgument, name, key)
+	return c.ApplyTransition(ctx, key, TransitionInput{Name: name, Comment: comment})
 }
 
 // LinkIssues links two issues. The link reads "<outwardKey> <type's outward description> <inwardKey>"

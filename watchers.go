@@ -78,7 +78,8 @@ func (c *Client) AddWatcher(ctx context.Context, key, accountID string) error {
 		payload = accountID
 	}
 
-	_, err := c.do(ctx, "POST", apiBase+"/issue/"+url.PathEscape(key)+"/watchers", payload)
+	// Watching is a state, so adding a watcher who is already one changes nothing.
+	_, err := c.postReplayable(ctx, apiBase+"/issue/"+url.PathEscape(key)+"/watchers", payload)
 	return err
 }
 

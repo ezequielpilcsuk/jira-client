@@ -18,6 +18,10 @@ const (
 
 	// maxProjectFilterValues is Jira's cap on the repeatable keys and id filters of /project/search.
 	maxProjectFilterValues = 50
+
+	// maxEmptyProjectPages is how many empty pages in a row /project/search may return before the scan
+	// is abandoned. One empty page is legitimate; this many without isLast means the end is not coming.
+	maxEmptyProjectPages = 100
 )
 
 // projectActions are the values /project/search accepts for its action filter, which narrows results
@@ -291,8 +295,9 @@ func (c *Client) Projects(ctx context.Context, filter ProjectQuery) ([]Project, 
 	}
 
 	var (
-		projects []Project
-		startAt  int
+		projects   []Project
+		startAt    int
+		emptyPages int
 	)
 	for {
 		params := url.Values{}
@@ -338,6 +343,14 @@ func (c *Client) Projects(ctx context.Context, filter ProjectQuery) ([]Project, 
 
 		if page.IsLast == true {
 			break
+		}
+		// One empty page proves nothing, but an unbroken run of them with isLast never set means the
+		// end is not going to be announced.
+		if len(page.Values) > 0 {
+			emptyPages = 0
+		} else if emptyPages++; emptyPages >= maxEmptyProjectPages {
+			return nil, fmt.Errorf("%w: /project/search returned %d empty pages in a row without marking the last",
+				ErrPaginationStalled, emptyPages)
 		}
 		// Advance by the page size, not by the number of rows returned. Jira documents that a
 		// requested page can legitimately come back empty while later pages still hold results, and
